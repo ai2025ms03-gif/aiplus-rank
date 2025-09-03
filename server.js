@@ -9,6 +9,14 @@ const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.set('trust proxy', true);
+// ───────────── 헬스체크 (Koyeb이 활성여부 확인) ─────────────
+// 인증 없이 200을 리턴해야 함
+app.get('/', (req, res) => {
+  res.send('OK');
+});
+app.get('/healthz', (req, res) => {
+  res.json({ ok: true });
+});
 
 // ───────────── 공통 유틸 ─────────────
 const UA = [
@@ -250,4 +258,4 @@ app.get('/rank', async (req, res) => {
 });
 
 const port = process.env.PORT || 8080;
-app.listen(port, () => console.log(`Relay listening on :${port}`));
+app.listen(port, '0.0.0.0', () => console.log(`Relay listening on :${port}`));
