@@ -126,15 +126,6 @@ async function fetchHtml(url, extraHeaders = {}) {
     }
   }
 
-  throw new Error(errors.join(' | '));
-}
-    } catch (e) {
-      lastErr = e;
-      if (attempt < maxTry) await sleep(backoff);
-    }
-  }
-  throw lastErr;
-}
 
 function parseIdsFromUrl(site, productUrl) {
   const out = {};
