@@ -27,6 +27,27 @@ const UA = [
 
 function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
+// 브라우저 지문 비슷한 헤더 세트
+function browserHeaders(host) {
+  return {
+    'User-Agent': pick(UA),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+    // 아래 4개가 403 회피에 꽤 효과적
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'same-origin',
+    'sec-fetch-user': '?1',
+    'upgrade-insecure-requests': '1',
+    ...(host ? { 'Host': host } : {})
+  };
+}
+
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
 function makeProxyAgent() {
   const list = (process.env.PROXY_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
   if (!list.length) return undefined;
@@ -37,29 +58,44 @@ function makeProxyAgent() {
 }
 
 async function fetchHtml(url, extraHeaders = {}) {
-  const agent = makeProxyAgent();
-  const headers = {
-    'User-Agent': pick(UA),
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
-    ...extraHeaders
-  };
-const timeout = Math.max(1, parseInt(process.env.TIMEOUT_MS || '20000', 10));
+  const timeout = Math.max(1, parseInt(process.env.TIMEOUT_MS || '45000', 10));
+  const maxTry = Math.max(1, parseInt(process.env.RETRY || '3', 10));
+  const backoff = Math.max(0, parseInt(process.env.RETRY_SLEEP_MS || '1200', 10));
 
-const res = await axios.get(url, {
-  httpAgent: agent,
-  httpsAgent: agent,
-  headers,
-  timeout,
-  validateStatus: () => true
-  });
-  if (res.status >= 400) {
-    const snippet = String(res.data).slice(0, 240);
-    throw new Error(`HTTP ${res.status} fetching ${url} :: ${snippet}`);
+  let lastErr;
+  for (let attempt = 1; attempt <= maxTry; attempt++) {
+    const agent = makeProxyAgent(); // 매 시도마다 프록시 재선택(회전)
+    const u = new URL(url);
+    const headers = {
+      ...browserHeaders(u.host),
+      ...extraHeaders
+    };
+    try {
+      const res = await axios.get(url, {
+        httpAgent: agent,
+        httpsAgent: agent,
+        headers,
+        timeout,
+        decompress: true,
+        validateStatus: () => true
+      });
+      // 강차단/봇페이지는 그대로 에러로
+      if (res.status >= 400) {
+        const snippet = String(res.data).slice(0, 240);
+        throw new Error(`HTTP ${res.status} fetching ${url} :: ${snippet}`);
+      }
+      const html = String(res.data);
+      // 오늘의집/쿠팡이 종종 “Access Denied”를 200으로 보낼 때가 있어 탐지
+      if (/Access Denied|봇이 감지|blocked|captcha/i.test(html)) {
+        throw new Error('200 but blocked page');
+      }
+      return html;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < maxTry) await sleep(backoff);
+    }
   }
-  return String(res.data);
+  throw lastErr;
 }
 
 function parseIdsFromUrl(site, productUrl) {
