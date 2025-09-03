@@ -87,9 +87,38 @@ async function rankOhouse(keyword, productUrl, maxPages = 10) {
   let scanned = 0;
   let total = null;
   for (let p = 1; p <= maxPages; p++) {
-    const url = `https://ohou.se/store/search?query=${encodeURIComponent(keyword)}&page=${p}`;
-    const html = await fetchHtml(url, { Referer: 'https://ohou.se/' });
-    const $ = cheerio.load(html);
+// (변경 후) rankOhouse() 내부
+// 기존 3줄( url, fetchHtml, $ )을 아래 블록으로 교체
+const enc = encodeURIComponent(keyword);
+const candidates = [
+  `https://ohou.se/store/search?keyword=${enc}&page=${p}`, // 1순위: keyword 파라미터
+  `https://ohou.se/store/search?query=${enc}&page=${p}`,   // 2순위: 기존 query 파라미터
+  `https://ohou.se/search?keyword=${enc}&page=${p}`        // 3순위: 경로 단축형
+];
+
+let html, $;
+let tried = [];
+for (const u of candidates) {
+  try {
+    html = await fetchHtml(u, { Referer: 'https://ohou.se/' });
+    $ = cheerio.load(html);
+    // 간단 건강검진: 결과 리스트가 있는지 확인 (없으면 다음 후보 시도)
+    const hasItems = $('a[href*="/productions/"][href$="/selling"]').length > 0;
+    if (!hasItems) {
+      tried.push(`200 but no items: ${u}`);
+      continue;
+    }
+    break; // 성공
+  } catch (e) {
+    tried.push(`${e.message?.slice(0, 120) || String(e)}`);
+    html = null;
+    $ = null;
+  }
+}
+
+if (!$) {
+  throw new Error(`오늘의집 검색 실패. tried=${tried.join(' | ')}`);
+}
 
     // 결과 총 개수(있으면)
     if (total == null) {
