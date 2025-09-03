@@ -46,12 +46,14 @@ async function fetchHtml(url, extraHeaders = {}) {
     'Pragma': 'no-cache',
     ...extraHeaders
   };
-  const res = await axios.get(url, {
-    httpAgent: agent,
-    httpsAgent: agent,
-    headers,
-    timeout: 20000,
-    validateStatus: () => true
+const timeout = Math.max(1, parseInt(process.env.TIMEOUT_MS || '20000', 10));
+
+const res = await axios.get(url, {
+  httpAgent: agent,
+  httpsAgent: agent,
+  headers,
+  timeout,
+  validateStatus: () => true
   });
   if (res.status >= 400) {
     const snippet = String(res.data).slice(0, 240);
