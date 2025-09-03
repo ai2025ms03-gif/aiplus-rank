@@ -48,48 +48,86 @@ function browserHeaders(host) {
 
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-function makeProxyAgent() {
-  const list = (process.env.PROXY_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
-  if (!list.length) return undefined;
-  const proxy = pick(list);
-  const isHttps = proxy.startsWith('https://') || proxy.startsWith('http://');
-  return proxy.startsWith('https:') ? new HttpsProxyAgent(proxy) :
-         proxy.startsWith('http:')  ? new HttpProxyAgent(proxy) : undefined;
+function normalizeProxyUrl(s) {
+  let u = s.trim();
+  if (!u) return null;
+  if (!/^https?:\/\//i.test(u)) u = 'http://' + u; // 접두사 없으면 http:// 추가
+  return u;
+}
+
+function makeProxyAgent(proxyUrl) {
+  if (!proxyUrl) return undefined;
+  const url = normalizeProxyUrl(proxyUrl);
+  if (!url) return undefined;
+  return url.startsWith('https://')
+    ? new HttpsProxyAgent(url)
+    : new HttpProxyAgent(url);
 }
 
 async function fetchHtml(url, extraHeaders = {}) {
-  const timeout = Math.max(1, parseInt(process.env.TIMEOUT_MS || '45000', 10));
-  const maxTry = Math.max(1, parseInt(process.env.RETRY || '3', 10));
-  const backoff = Math.max(0, parseInt(process.env.RETRY_SLEEP_MS || '1200', 10));
+  const rawList = (process.env.PROXY_URLS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
 
-  let lastErr;
-  for (let attempt = 1; attempt <= maxTry; attempt++) {
-    const agent = makeProxyAgent(); // 매 시도마다 프록시 재선택(회전)
-    const u = new URL(url);
+  // 프록시가 0개여도 동작은 하되, 프록시가 있으면 회전 재시도
+  const proxyList = rawList.length ? rawList : [null];
+
+  const timeout = Math.max(1, parseInt(process.env.TIMEOUT_MS || '20000', 10));
+  const errors = [];
+
+  for (let attempt = 0; attempt < Math.min(proxyList.length, 5); attempt++) {
+    const p = proxyList[attempt % proxyList.length];
+    const agent = makeProxyAgent(p);
+
     const headers = {
-      ...browserHeaders(u.host),
+      'User-Agent': pick(UA),
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Connection': 'close',           // 프록시가 keep-alive 싫어하는 케이스 방지
+      'Accept-Encoding': 'identity',   // 압축/중간 프록시 문제 줄이기
       ...extraHeaders
     };
+
     try {
       const res = await axios.get(url, {
         httpAgent: agent,
         httpsAgent: agent,
         headers,
         timeout,
-        decompress: true,
-        validateStatus: () => true
+        maxRedirects: 5,
+        decompress: false,
+        validateStatus: () => true,
+        transitional: { clarifyTimeoutError: true }
       });
-      // 강차단/봇페이지는 그대로 에러로
+
       if (res.status >= 400) {
         const snippet = String(res.data).slice(0, 240);
+        // 403/429 등은 다른 프록시로 재시도
+        if (res.status === 403 || res.status === 429) {
+          errors.push(`HTTP ${res.status} via ${p || 'direct'}`);
+          continue;
+        }
         throw new Error(`HTTP ${res.status} fetching ${url} :: ${snippet}`);
       }
-      const html = String(res.data);
-      // 오늘의집/쿠팡이 종종 “Access Denied”를 200으로 보낼 때가 있어 탐지
-      if (/Access Denied|봇이 감지|blocked|captcha/i.test(html)) {
-        throw new Error('200 but blocked page');
+      return String(res.data);
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      errors.push(`${msg} via ${p || 'direct'}`);
+
+      // 재시도 가치 있는 에러면 다음 프록시로
+      if (/ECONNRESET|ETIMEDOUT|socket hang up|timeout/i.test(msg)) {
+        continue;
       }
-      return html;
+      // 그 외는 즉시 실패
+      throw new Error(errors.join(' | '));
+    }
+  }
+
+  throw new Error(errors.join(' | '));
+}
     } catch (e) {
       lastErr = e;
       if (attempt < maxTry) await sleep(backoff);
