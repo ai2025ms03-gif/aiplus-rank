@@ -9,8 +9,8 @@ const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.set('trust proxy', true);
+
 // ───────────── 헬스체크 (Koyeb이 활성여부 확인) ─────────────
-// 인증 없이 200을 리턴해야 함
 app.get('/', (req, res) => {
   res.send('OK');
 });
@@ -24,70 +24,68 @@ const UA = [
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36'
 ];
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
-function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+const browserHeaders = (host) => ({
+  'User-Agent': pick(UA),
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+  'sec-fetch-dest': 'document',
+  'sec-fetch-mode': 'navigate',
+  'sec-fetch-site': 'same-origin',
+  'sec-fetch-user': '?1',
+  'upgrade-insecure-requests': '1',
+  ...(host ? { Host: host } : {})
+});
 
-// 브라우저 지문 비슷한 헤더 세트
-function browserHeaders(host) {
-  return {
-    'User-Agent': pick(UA),
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
-    // 아래 4개가 403 회피에 꽤 효과적
-    'sec-fetch-dest': 'document',
-    'sec-fetch-mode': 'navigate',
-    'sec-fetch-site': 'same-origin',
-    'sec-fetch-user': '?1',
-    'upgrade-insecure-requests': '1',
-    ...(host ? { 'Host': host } : {})
-  };
-}
-
-function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-function normalizeProxyUrl(s) {
-  let u = s.trim();
+const normalizeProxyUrl = (s) => {
+  let u = (s || '').trim();
   if (!u) return null;
-  if (!/^https?:\/\//i.test(u)) u = 'http://' + u; // 접두사 없으면 http:// 추가
+  if (!/^https?:\/\//i.test(u)) u = 'http://' + u;
   return u;
-}
+};
 
-function makeProxyAgent(proxyUrl) {
+const makeProxyAgent = (proxyUrl) => {
   if (!proxyUrl) return undefined;
   const url = normalizeProxyUrl(proxyUrl);
   if (!url) return undefined;
-  return url.startsWith('https://')
-    ? new HttpsProxyAgent(url)
-    : new HttpProxyAgent(url);
-}
+  return url.startsWith('https://') ? new HttpsProxyAgent(url) : new HttpProxyAgent(url);
+};
 
+/**
+ * 프록시 회전/재시도 포함 HTML GET
+ */
 async function fetchHtml(url, extraHeaders = {}) {
   const rawList = (process.env.PROXY_URLS || '')
     .split(',')
-    .map(s => s.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
 
-  // 프록시가 0개여도 동작은 하되, 프록시가 있으면 회전 재시도
-  const proxyList = rawList.length ? rawList : [null];
-
+  const proxyList = rawList.length ? rawList : [null]; // 프록시 없으면 직접접속
   const timeout = Math.max(1, parseInt(process.env.TIMEOUT_MS || '20000', 10));
   const errors = [];
 
-  for (let attempt = 0; attempt < Math.min(proxyList.length, 5); attempt++) {
+  // URL 호스트(헤더 보강용)
+  let hostHeader = undefined;
+  try {
+    hostHeader = new URL(url).host;
+  } catch (_) {}
+
+  // 최대 5회까지(프록시 갯수만큼) 시도
+  const maxAttempts = Math.min(proxyList.length, 5);
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const p = proxyList[attempt % proxyList.length];
     const agent = makeProxyAgent(p);
 
+    // 일부 프록시/사이트와의 상성 때문에 연결/압축 옵션 보수적으로
     const headers = {
-      'User-Agent': pick(UA),
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache',
-      'Connection': 'close',           // 프록시가 keep-alive 싫어하는 케이스 방지
-      'Accept-Encoding': 'identity',   // 압축/중간 프록시 문제 줄이기
+      ...browserHeaders(hostHeader),
+      Connection: 'close',
+      'Accept-Encoding': 'identity',
       ...extraHeaders
     };
 
@@ -103,21 +101,24 @@ async function fetchHtml(url, extraHeaders = {}) {
         transitional: { clarifyTimeoutError: true }
       });
 
+      // 4xx/5xx
       if (res.status >= 400) {
         const snippet = String(res.data).slice(0, 240);
-        // 403/429 등은 다른 프록시로 재시도
+        // 403/429 → 다음 프록시로 재시도
         if (res.status === 403 || res.status === 429) {
           errors.push(`HTTP ${res.status} via ${p || 'direct'}`);
           continue;
         }
         throw new Error(`HTTP ${res.status} fetching ${url} :: ${snippet}`);
       }
+
+      // OK
       return String(res.data);
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
       errors.push(`${msg} via ${p || 'direct'}`);
 
-      // 재시도 가치 있는 에러면 다음 프록시로
+      // 재시도 가치 있는 네트워크성 오류
       if (/ECONNRESET|ETIMEDOUT|socket hang up|timeout/i.test(msg)) {
         continue;
       }
@@ -126,6 +127,9 @@ async function fetchHtml(url, extraHeaders = {}) {
     }
   }
 
+  // 모든 시도 실패
+  throw new Error(errors.join(' | '));
+}
 
 function parseIdsFromUrl(site, productUrl) {
   const out = {};
@@ -153,49 +157,54 @@ async function rankOhouse(keyword, productUrl, maxPages = 10) {
 
   let scanned = 0;
   let total = null;
+
   for (let p = 1; p <= maxPages; p++) {
-// (변경 후) rankOhouse() 내부
-// 기존 3줄( url, fetchHtml, $ )을 아래 블록으로 교체
-const enc = encodeURIComponent(keyword);
-const candidates = [
-  `https://ohou.se/store/search?keyword=${enc}&page=${p}`, // 1순위: keyword 파라미터
-  `https://ohou.se/store/search?query=${enc}&page=${p}`,   // 2순위: 기존 query 파라미터
-  `https://ohou.se/search?keyword=${enc}&page=${p}`        // 3순위: 경로 단축형
-];
+    const enc = encodeURIComponent(keyword);
+    const candidates = [
+      `https://ohou.se/store/search?keyword=${enc}&page=${p}`,
+      `https://ohou.se/store/search?query=${enc}&page=${p}`,
+      `https://ohou.se/search?keyword=${enc}&page=${p}`
+    ];
 
-let html, $;
-let tried = [];
-for (const u of candidates) {
-  try {
-    html = await fetchHtml(u, { Referer: 'https://ohou.se/' });
-    $ = cheerio.load(html);
-    // 간단 건강검진: 결과 리스트가 있는지 확인 (없으면 다음 후보 시도)
-    const hasItems = $('a[href*="/productions/"][href$="/selling"]').length > 0;
-    if (!hasItems) {
-      tried.push(`200 but no items: ${u}`);
-      continue;
+    let html = null;
+    let $ = null;
+    const tried = [];
+
+    for (const u of candidates) {
+      try {
+        html = await fetchHtml(u, { Referer: 'https://ohou.se/' });
+        $ = cheerio.load(html);
+
+        // 결과 아이템이 실제로 있는지 체크
+        const hasItems = $('a[href*="/productions/"][href$="/selling"]').length > 0;
+        if (!hasItems) {
+          tried.push(`200 but no items: ${u}`);
+          html = null;
+          $ = null;
+          continue;
+        }
+        break; // 성공
+      } catch (e) {
+        tried.push((e && e.message) ? e.message.slice(0, 120) : String(e));
+        html = null;
+        $ = null;
+      }
     }
-    break; // 성공
-  } catch (e) {
-    tried.push(`${e.message?.slice(0, 120) || String(e)}`);
-    html = null;
-    $ = null;
-  }
-}
 
-if (!$) {
-  throw new Error(`오늘의집 검색 실패. tried=${tried.join(' | ')}`);
-}
+    if (!$) {
+      throw new Error(`오늘의집 검색 실패. tried=${tried.join(' | ')}`);
+    }
 
-    // 결과 총 개수(있으면)
+    // 결과 총개수(있으면)
     if (total == null) {
-      const t = $('span').filter((_,el)=>/검색결과/.test($(el).text())).first().text();
+      const txt = $('span').filter((_, el) => /검색결과/.test($(el).text())).first().text();
       total = total ?? null;
     }
 
+    // 리스트 파싱
     const items = [];
     $('a[href*="/productions/"][href$="/selling"]').each((_, a) => {
-      const href = $(a).attr('href');
+      const href = $(a).attr('href') || '';
       const pid = /\/productions\/(\d+)\/selling/.exec(href)?.[1];
       if (pid) {
         const title = $(a).attr('title') || $(a).find('[class*="production-item__"]').text().trim();
@@ -217,7 +226,8 @@ if (!$) {
       if (uniq[i].productId === want) {
         return {
           site: 'ohou',
-          keyword, productUrl,
+          keyword,
+          productUrl,
           rank: scanned,
           page: p,
           scanned,
@@ -229,11 +239,12 @@ if (!$) {
         };
       }
     }
-    scanned += 0; // for clarity
   }
+
   return {
     site: 'ohou',
-    keyword, productUrl,
+    keyword,
+    productUrl,
     rank: null,
     page: null,
     scanned,
@@ -245,10 +256,11 @@ if (!$) {
 }
 
 // ───────────── 쿠팡 랭킹 ─────────────
-// HTML 목록을 파싱하는 방식. 프록시 없으면 실패 확률 높음.
 async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36) {
   const want = parseIdsFromUrl('coupang', productUrl); // productId/itemId/vendorItemId
-  if (!want.productId) throw new Error('쿠팡: productId 파싱 실패(예: https://www.coupang.com/vp/products/000?itemId=...&vendorItemId=...)');
+  if (!want.productId) {
+    throw new Error('쿠팡: productId 파싱 실패(예: https://www.coupang.com/vp/products/000?itemId=...&vendorItemId=...)');
+  }
 
   let scanned = 0;
   let total = null;
@@ -261,7 +273,7 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36) {
     });
     const $ = cheerio.load(html);
 
-    // 총 개수 추정값(있으면)
+    // 총 개수 추정(있으면)
     if (total == null) {
       const txt = $('div.search-form strong').first().text().replace(/[^\d]/g, '');
       total = txt ? parseInt(txt, 10) : null;
@@ -271,7 +283,7 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36) {
     $('li.search-product[data-product-id]').each((_, li) => {
       const el = $(li);
       const productId = (el.attr('data-product-id') || '').trim();
-      const itemId    = (el.attr('data-item-id') || '').trim();
+      const itemId = (el.attr('data-item-id') || '').trim();
       const vendorItemId = (el.attr('data-vendor-item-id') || '').trim();
       const a = el.find('a.search-product-link').first();
       const href = a.attr('href') || '';
@@ -281,7 +293,7 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36) {
       items.push({ productId, itemId, vendorItemId, link, title });
     });
 
-    // 랭크 매칭 로직: vendorItemId > itemId > productId 우선
+    // 매칭 우선순위: vendorItemId > itemId > productId
     const match = (it) => {
       if (want.vendorItemId && it.vendorItemId === want.vendorItemId) return true;
       if (want.itemId && it.itemId === want.itemId) return true;
@@ -294,7 +306,8 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36) {
       if (match(items[i])) {
         return {
           site: 'coupang',
-          keyword, productUrl,
+          keyword,
+          productUrl,
           rank: scanned,
           page: p,
           scanned,
@@ -310,7 +323,8 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36) {
 
   return {
     site: 'coupang',
-    keyword, productUrl,
+    keyword,
+    productUrl,
     rank: null,
     page: null,
     scanned,
@@ -325,19 +339,22 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36) {
 // ───────────── 라우터 ─────────────
 app.get('/rank', async (req, res) => {
   try {
-    // 인증
+    // 인증(선택)
     if (process.env.RELAY_KEY) {
       const key = req.header('X-Relay-Key') || req.query.key;
-      if (key !== process.env.RELAY_KEY) return res.status(401).json({ error: 'unauthorized' });
+      if (key !== process.env.RELAY_KEY) {
+        return res.status(401).json({ error: 'unauthorized' });
+      }
     }
 
-    const site = String(req.query.site || 'naver');
+    const site = String(req.query.site || '').trim();
     const kw = String(req.query.kw || '').trim();
     const productUrl = String(req.query.productUrl || '').trim();
     const maxPages = Math.min(10, Math.max(1, parseInt(req.query.maxPages || '10', 10)));
 
     if (!kw) return res.status(400).json({ error: 'kw required' });
     if (!productUrl) return res.status(400).json({ error: 'productUrl required' });
+    if (!site) return res.status(400).json({ error: 'site required' });
 
     let data;
     if (site === 'ohou' || site === 'ohouse') {
