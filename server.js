@@ -76,12 +76,12 @@ function makeProxyAgent(proxyUrl) {
 async function probe(proxyUrl) {
   try {
     const ag = makeProxyAgent(proxyUrl);
-    const r = await axios.get('https://ipinfo.io/json', {
-      httpAgent: ag, httpsAgent: ag,
-      timeout: Math.min(TIMEOUT_MS, 8000),
-      validateStatus: () => true,
-      headers: { 'user-agent': pick(UA_POOL), 'accept': 'application/json' }
-    });
+const r = await axios.get('https://ipinfo.thordata.com', {
+  httpAgent: ag, httpsAgent: ag,
+  timeout: Math.min(TIMEOUT_MS, 12000),
+  validateStatus: () => true,
+  headers: { 'user-agent': pick(UA), 'accept': 'application/json' }
+});
     return r.status > 0; // (4xx라도) 응답 형식이 오면 통신 OK로 간주
   } catch {
     return false;
