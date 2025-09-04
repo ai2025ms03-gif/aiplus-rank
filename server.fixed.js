@@ -1,4 +1,4 @@
-﻿/* Minimal Express server (clean) */
+/* Minimal Express server (clean) */
 const express = require('express');
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
@@ -12,7 +12,8 @@ app.set('trust proxy', true);
 app.get('/', (req, res) => res.send('OK'));
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
-// GET /fetch?url=https://example.com  (프록시 동작/크롤링 테스트용)
+// Simple fetch endpoint to test proxy/crawling from the server
+// GET /fetch?url=https://example.com
 app.get('/fetch', async (req, res) => {
   try {
     const url = String(req.query.url || '');
@@ -38,4 +39,4 @@ app.get('/fetch', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(\[server] listening on :\\));
+app.listen(PORT, () => console.log(`[server] listening on :${PORT}`));
