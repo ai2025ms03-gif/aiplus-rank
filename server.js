@@ -524,6 +524,9 @@ async function rankCoupangPW(keyword, productUrl, { pageMax = 5, listSize = 72 }
 // 스마트 래퍼: axios 성공시 그대로, 실패/미발견시 PW로 승격
 // =========================
 async function rankOhouseSmart(keyword, productUrl, maxPages = 10, maxTries = 2) {
+     if (String(process.env.FAST_PW_OHOU || '').toLowerCase() === 'true') {
+    return await rankOhousePW(keyword, productUrl, { pageMax: Math.min(5, maxPages) });
+  }
   try {
     const r = await rankOhouse(keyword, productUrl, maxPages, maxTries); // 기존 axios 버전
     if (r && r.rank != null) return r;
