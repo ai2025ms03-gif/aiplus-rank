@@ -1,23 +1,20 @@
 {
-  "name": "rank-relay",
+  "name": "aiplus-rank",
   "version": "1.0.0",
   "private": true,
-  "main": "server.js",
-  "type": "commonjs",
+  "engines": { "node": ">=20" },
   "scripts": {
     "start": "node server.js",
-    "start:local": "set PORT=8080&& node server.js"
-  },
-  "engines": {
-    "node": "20.x"
+    "start:local": "set PORT=8080&& node server.js",
+    "start:dev": "set DEBUG=1&& node server.js"
   },
   "dependencies": {
     "axios": "^1.7.0",
     "cheerio": "^1.0.0",
-    "express": "^4.19.0",
+    "express": "^4.19.2",
     "http-proxy-agent": "^7.0.2",
-    "https-proxy-agent": "^7.0.4",
-    "socks-proxy-agent": "^8.0.2",
+    "https-proxy-agent": "^7.0.5",
+    "socks-proxy-agent": "^8.0.3",
     "uuid": "^9.0.1"
   }
 }
