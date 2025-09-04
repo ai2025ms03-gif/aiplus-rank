@@ -1,10 +1,12 @@
 {
   "name": "rank-relay",
   "version": "1.0.0",
+  "private": true,
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "start:local": "set PORT=8080&& node server.js"
   },
   "engines": {
     "node": "20.x"
