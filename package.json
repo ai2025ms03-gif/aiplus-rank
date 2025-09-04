@@ -2,23 +2,20 @@
   "name": "rank-relay",
   "version": "1.0.0",
   "main": "server.js",
-  "license": "MIT",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": "20.x"
   },
   "dependencies": {
-    "axios": "^1.11.0",
-    "axios-cookiejar-support": "^6.0.4",
-    "cheerio": "^1.1.2",
-    "dotenv": "^16.4.5",
-    "express": "^4.21.2",
+    "axios": "^1.7.0",
+    "cheerio": "^1.0.0",
+    "express": "^4.19.0",
     "http-proxy-agent": "^7.0.2",
-    "https-proxy-agent": "^7.0.6",
-    "socks-proxy-agent": "^8.0.5",
-    "tough-cookie": "^5.1.2",
+    "https-proxy-agent": "^7.0.4",
+    "socks-proxy-agent": "^8.0.2",
     "uuid": "^9.0.1"
   }
 }
