@@ -1,4 +1,4 @@
-/* eslint-disable */
+﻿/* eslint-disable */
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -11,7 +11,7 @@ const app = express();
 app.set('trust proxy', true);
 
 /* =========================
-   헬스체크 (Koyeb 확인용)
+   ?ъ뒪泥댄겕 (Koyeb ?뺤씤??
    ========================= */
 app.get('/', (req, res) => res.send('OK'));
 app.get('/healthz', (req, res) => {
@@ -31,7 +31,7 @@ app.get('/healthz', (req, res) => {
 });
 
 /* ================
-   공통 유틸
+   怨듯넻 ?좏떥
    ================ */
 const UA = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
@@ -41,10 +41,17 @@ const UA = [
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
 const browserHeaders = (host) => ({
+<<<<<<< HEAD
   'User-Agent': pick(UA),
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
   'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
   'Accept-Encoding': 'identity',
+=======
+  'User-Agent': pick(UA),  // 留??붿껌 ?쒕뜡
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Accept-Encoding': 'identity', // ?쇰? ?꾨줉???ъ씠?몄? ?명솚????
+>>>>>>> 9fcd1d6 (Initial commit)
   'Cache-Control': 'no-cache',
   'Pragma': 'no-cache',
   'sec-fetch-dest': 'document',
@@ -59,7 +66,7 @@ const browserHeaders = (host) => ({
 const TIMEOUT_MS = Math.max(1, parseInt(process.env.TIMEOUT_MS || '45000', 10));
 
 /* ==========================================
-   프록시 유틸 (사이트별 풀 + SOCKS 지원 + 워밍업 스킵 옵션)
+   ?꾨줉???좏떥 (?ъ씠?몃퀎 ? + SOCKS 吏??+ ?뚮컢???ㅽ궢 ?듭뀡)
    ========================================== */
 function parseProxyList(name) {
   return String(process.env[name] || '')
@@ -77,7 +84,11 @@ function makeProxyAgent(proxyUrl) {
   return proto === 'http:' ? new HttpProxyAgent(withScheme) : new HttpsProxyAgent(withScheme);
 }
 
+<<<<<<< HEAD
 // 워밍업용 간단 통신 확인
+=======
+// ?뚮컢?낆슜 媛꾨떒 ?듭떊 ?뺤씤 (怨듦툒???붾뱶?ъ씤??
+>>>>>>> 9fcd1d6 (Initial commit)
 async function probe(proxyUrl) {
   try {
     const ag = makeProxyAgent(proxyUrl);
@@ -93,7 +104,7 @@ async function probe(proxyUrl) {
   }
 }
 
-// 프록시 풀 초기화
+// ?꾨줉??? 珥덇린??
 async function warmupProxies() {
   const pools = {
     ohou: parseProxyList('PROXY_URLS_OHOU'),
@@ -116,7 +127,7 @@ async function warmupProxies() {
 
   global.__PROXIES = pools;
 
-  // 라운드로빈 제너레이터
+  // ?쇱슫?쒕줈鍮??쒕꼫?덉씠??
   function* rr(arr){ let i=0; while(true) yield arr[i++ % arr.length]; }
   global.__RR = {
     ohou: (pools.ohou?.length ? rr(pools.ohou) : null),
@@ -131,13 +142,22 @@ async function warmupProxies() {
     common: pools.common.length
   });
 }
+<<<<<<< HEAD
+=======
+
+// 鍮꾩감???뚮컢??(?쒕쾭 ?쒖옉 ??1??
+>>>>>>> 9fcd1d6 (Initial commit)
 warmupProxies();
 
-// RR가 아직 없을 때도 env에서 즉시 1개 골라 쓰도록 안전화
+// RR媛 ?꾩쭅 ?놁쓣 ?뚮룄 env?먯꽌 利됱떆 1媛?怨⑤씪 ?곕룄濡??덉쟾??
 function nextProxy(site) {
   const r = (global.__RR?.[site]) || (global.__RR?.common);
   if (r) return r.next().value;
 
+<<<<<<< HEAD
+=======
+  // RR 珥덇린???꾩씠硫?env?먯꽌 利됱떆 ?ъ슜
+>>>>>>> 9fcd1d6 (Initial commit)
   const pools = {
     ohou: parseProxyList('PROXY_URLS_OHOU'),
     coupang: parseProxyList('PROXY_URLS_COUPANG'),
@@ -150,10 +170,14 @@ function nextProxy(site) {
 }
 
 /* ==========================================
-   초간단 쿠키 상태(문자열) 헬퍼 — 같은 요청 흐름에서만 사용
+   珥덇컙??荑좏궎 ?곹깭(臾몄옄?? ?ы띁 ??媛숈? ?붿껌 ?먮쫫?먯꽌留??ъ슜
    ========================================== */
 function buildCookieHeader(prevCookie, setCookieArray) {
   const jar = new Map();
+<<<<<<< HEAD
+=======
+  // 湲곗〈 荑좏궎 諛섏쁺
+>>>>>>> 9fcd1d6 (Initial commit)
   if (prevCookie) {
     prevCookie.split(';').map(s => s.trim()).forEach(kv => {
       const [k, ...rest] = kv.split('=');
@@ -161,20 +185,29 @@ function buildCookieHeader(prevCookie, setCookieArray) {
       jar.set(k, rest.join('='));
     });
   }
+<<<<<<< HEAD
+=======
+  // ?좉퇋 Set-Cookie 諛섏쁺
+>>>>>>> 9fcd1d6 (Initial commit)
   (setCookieArray || []).forEach(sc => {
     const part = String(sc).split(';')[0];
     const [k, ...rest] = part.split('=');
     if (!k) return;
     jar.set(k, rest.join('='));
   });
+<<<<<<< HEAD
+=======
+  // ?ъ“由?
+>>>>>>> 9fcd1d6 (Initial commit)
   return Array.from(jar.entries()).map(([k,v]) => `${k}=${v}`).join('; ');
 }
 
 /* ==========================================
-   HTML GET (프록시 회전 + 재시도 + 쿠키 문자열 지원)
+   HTML GET (?꾨줉???뚯쟾 + ?ъ떆??+ 荑좏궎 臾몄옄??吏??
    ========================================== */
 /**
  * @param {string} url
+<<<<<<< HEAD
  * @param {object} extraHeaders
  * @param {object} opts - {
  *   site?: 'ohou'|'coupang'|'common',
@@ -183,6 +216,10 @@ function buildCookieHeader(prevCookie, setCookieArray) {
  *   forceProxy?: string,           // 디버그용: 특정 프록시 강제
  *   hedgeCount?: number            // 병렬로 동시에 보내는 프록시 수(최대 2)
  * }
+=======
+ * @param {object} extraHeaders - 異붽? ?ㅻ뜑
+ * @param {object} opts - { site?: 'ohou'|'coupang'|'common', maxTries?: number, cookieState?: {cookie?: string} }
+>>>>>>> 9fcd1d6 (Initial commit)
  * @returns {Promise<{html: string, cookie: string}>}
  */
 async function fetchHtml(
@@ -286,8 +323,29 @@ async function fetchHtml(
         } catch {}
       });
 
+<<<<<<< HEAD
       if (n === 1) {
         return await tryOnce(picks[0]);
+=======
+      const ms = Date.now() - t0;
+      console.log(JSON.stringify({
+        site, host: hostHeader, status: res.status, ms,
+        via: p ? new URL(/^[a-z]+:\/\//.test(p) ? p : `http://${p}`).host : 'direct'
+      }));
+
+      // 荑좏궎 ?섏쭛
+      const setCookie = res.headers?.['set-cookie'] || res.headers?.['Set-Cookie'];
+      if (setCookie) {
+        cookie = buildCookieHeader(cookie, Array.isArray(setCookie) ? setCookie : [setCookie]);
+      }
+      if (cookieState) cookieState.cookie = cookie;
+
+      if (res.status >= 200 && res.status < 300) return { html: String(res.data), cookie };
+      if ([301,302,303,307,308].includes(res.status)) return { html: String(res.data), cookie };
+
+      if ([403,429].includes(res.status)) {
+        errors.push(`HTTP ${res.status} via ${p || 'direct'}`);
+>>>>>>> 9fcd1d6 (Initial commit)
       } else {
         const tasks = picks.map(p =>
           tryOnce(p).catch(e => {
@@ -307,7 +365,7 @@ async function fetchHtml(
       }
     }
 
-    // 지수 백오프 + 지터
+    // 吏??諛깆삤??+ 吏??
     const wait = Math.min(3500, 500 * Math.pow(1.6, attempt)) + Math.floor(Math.random() * 300);
     await new Promise(r => setTimeout(r, wait));
   }
@@ -316,7 +374,7 @@ async function fetchHtml(
 }
 
 /* =========================
-   보조: URL에서 ID 추출
+   蹂댁“: URL?먯꽌 ID 異붿텧
    ========================= */
 function parseIdsFromUrl(site, productUrl) {
   const out = {};
@@ -544,15 +602,23 @@ async function rankCoupangSmart(keyword, productUrl, maxPages = 10, listSize = 3
 }
 
 /* =========================
-   오늘의집 랭킹
+   ?ㅻ뒛?섏쭛 ??궧
    ========================= */
 async function rankOhouse(keyword, productUrl, maxPages = 10, maxTries = 2) {
   const want = parseIdsFromUrl('ohou', productUrl).productId;
-  if (!want) throw new Error('오늘의집: productId 파싱 실패(예: https://ohou.se/productions/1132252/selling)');
+  if (!want) throw new Error('?ㅻ뒛?섏쭛: productId ?뚯떛 ?ㅽ뙣(?? https://ohou.se/productions/1132252/selling)');
 
+<<<<<<< HEAD
   const cookies = { cookie: '' };
 
   await fetchHtml('https://ohou.se/', {}, { site: 'ohou', cookieState: cookies, maxTries, hedgeCount: 2 });
+=======
+  // ???붿껌 ?먮쫫 ?댁뿉??怨듭쑀??荑좏궎 臾몄옄???곹깭
+  const cookies = { cookie: '' };
+
+  // ???뚮컢??荑좏궎/?몄뀡 ?뺣낫)
+  await fetchHtml('https://ohou.se/', {}, { site: 'ohou', cookieState: cookies });
+>>>>>>> 9fcd1d6 (Initial commit)
 
   let scanned = 0;
   let total = null;
@@ -560,8 +626,8 @@ async function rankOhouse(keyword, productUrl, maxPages = 10, maxTries = 2) {
   for (let p = 1; p <= maxPages; p++) {
     const enc = encodeURIComponent(keyword);
     const candidates = [
-      `https://ohou.se/store/search?keyword=${enc}&page=${p}`,
-      `https://ohou.se/store/search?query=${enc}&page=${p}`,
+      `https://ohou.se/search/index?query=${enc}&page=${p}`,
+      `https://ohou.se/search/index?query=${enc}&page=${p}`,
       `https://ohou.se/search?keyword=${enc}&page=${p}`
     ];
 
@@ -592,7 +658,7 @@ async function rankOhouse(keyword, productUrl, maxPages = 10, maxTries = 2) {
     }
 
     if (!$) {
-      throw new Error(`오늘의집 검색 실패. tried=${tried.join(' | ')}`);
+      throw new Error(`?ㅻ뒛?섏쭛 寃???ㅽ뙣. tried=${tried.join(' | ')}`);
     }
 
     const items = [];
@@ -653,16 +719,20 @@ async function rankOhouse(keyword, productUrl, maxPages = 10, maxTries = 2) {
 }
 
 /* =========================
-   쿠팡 랭킹
+   荑좏뙜 ??궧
    ========================= */
 async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36, maxTries = 2) {
   const want = parseIdsFromUrl('coupang', productUrl);
   if (!want.productId) {
-    throw new Error('쿠팡: productId 파싱 실패(예: https://www.coupang.com/vp/products/000?itemId=...&vendorItemId=...)');
+    throw new Error('荑좏뙜: productId ?뚯떛 ?ㅽ뙣(?? https://www.coupang.com/vp/products/000?itemId=...&vendorItemId=...)');
   }
 
   const cookies = { cookie: '' };
 
+<<<<<<< HEAD
+=======
+  // ???뚮컢??荑좏궎/?몄뀡 ?뺣낫)
+>>>>>>> 9fcd1d6 (Initial commit)
   await fetchHtml('https://www.coupang.com/', {
     'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.7'
   }, { site: 'coupang', cookieState: cookies, maxTries, hedgeCount: 2 });
@@ -753,10 +823,14 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36, ma
 }
 
 /* =========================
-   라우터
+   ?쇱슦??
    ========================= */
 app.get('/rank', async (req, res) => {
   try {
+<<<<<<< HEAD
+=======
+    // (?좏깮) API ???몄쬆
+>>>>>>> 9fcd1d6 (Initial commit)
     if (process.env.RELAY_KEY) {
       const key = req.header('X-Relay-Key') || req.query.key;
       if (key !== process.env.RELAY_KEY) {
