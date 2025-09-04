@@ -334,6 +334,212 @@ function parseIdsFromUrl(site, productUrl) {
   return out;
 }
 
+// =========================
+// Playwright Fallback 헬퍼
+// =========================
+async function withChromium(proxyUrl, fn) {
+  const { chromium } = await import('playwright'); // CJS에서도 동작하는 동적 import
+  const browser = await chromium.launch({
+    headless: false, // headful이 차단 회피에 유리
+    proxy: proxyUrl ? { server: proxyUrl } : undefined,
+    args: ['--disable-blink-features=AutomationControlled'],
+  });
+  try {
+    const ctx = await browser.newContext({
+      locale: 'ko-KR',
+      timezoneId: 'Asia/Seoul',
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    });
+    const page = await ctx.newPage();
+    page.setDefaultTimeout(45000);
+    return await fn(page, ctx);
+  } finally {
+    await browser.close();
+  }
+}
+function jitter(ms) { return new Promise(r => setTimeout(r, ms + Math.floor(Math.random() * 700))); }
+
+// =========================
+// 오늘의집: Playwright Fallback
+// =========================
+async function rankOhousePW(keyword, productUrl, { pageMax = 5 } = {}) {
+  const want = parseIdsFromUrl('ohou', productUrl).productId;
+  if (!want) throw new Error('오늘의집 productId 파싱 실패(예: https://ohou.se/productions/1132252/selling)');
+
+  const proxy = nextProxy('ohou') || nextProxy('common'); // 기존 RR 재사용
+
+  return await withChromium(proxy, async (page) => {
+    // 워밍업 후 시작
+    await page.goto('https://ohou.se/', { waitUntil: 'domcontentloaded' });
+    await jitter(800);
+
+    let scanned = 0;
+    let total = null;
+    for (let p = 1; p <= pageMax; p++) {
+      const url = `https://ohou.se/store/search?keyword=${encodeURIComponent(keyword)}&page=${p}`;
+      await page.goto(url, { waitUntil: 'domcontentloaded' });
+
+      // 사람처럼 스크롤
+      for (let i = 0; i < 3; i++) { await page.mouse.wheel(0, 1400); await jitter(900); }
+
+      // DOM 파싱 (SPA여도 SSR 결과가 있을 때가 많음)
+      const items = await page.$$eval('a[href*="/productions/"][href$="/selling"]', (els) => {
+        return els.map(a => {
+          const href = a.getAttribute('href') || '';
+          const m = href.match(/\/productions\/(\d+)\/selling/);
+          const productId = m && m[1];
+          const title =
+            a.getAttribute('title') ||
+            (a.querySelector('[class*="production-item__"]')?.textContent || '').trim();
+          if (productId) {
+            return {
+              productId,
+              link: href.startsWith('http') ? href : `https://ohou.se${href}`,
+              title: title || ''
+            };
+          }
+          return null;
+        }).filter(Boolean);
+      });
+
+      // 중복 제거(첫 등장만 유효)
+      const seen = new Set();
+      const uniq = items.filter(it => (seen.has(it.productId) ? false : (seen.add(it.productId), true)));
+
+      for (let i = 0; i < uniq.length; i++) {
+        scanned++;
+        if (String(uniq[i].productId) === String(want)) {
+          return {
+            site: 'ohou',
+            keyword,
+            productUrl,
+            rank: scanned,
+            page: p,
+            scanned,
+            total,
+            foundItem: uniq[i],
+            idInfo: { productId: want },
+            requestId: uuidv4(),
+            itemsPerPage: uniq.length
+          };
+        }
+      }
+      await jitter(1200);
+    }
+
+    return {
+      site: 'ohou',
+      keyword,
+      productUrl,
+      rank: null,
+      page: null,
+      scanned,
+      total,
+      foundItem: null,
+      idInfo: { productId: want },
+      requestId: uuidv4()
+    };
+  });
+}
+
+// =========================
+// 쿠팡: Playwright Fallback
+// =========================
+async function rankCoupangPW(keyword, productUrl, { pageMax = 5, listSize = 72 } = {}) {
+  const want = parseIdsFromUrl('coupang', productUrl);
+  if (!want.productId) {
+    throw new Error('쿠팡 productId 파싱 실패(예: https://www.coupang.com/vp/products/000?itemId=...&vendorItemId=...)');
+  }
+
+  const proxy = nextProxy('coupang') || nextProxy('common');
+
+  return await withChromium(proxy, async (page) => {
+    let scanned = 0;
+    let total = null;
+
+    for (let p = 1; p <= pageMax; p++) {
+      const url =
+        `https://www.coupang.com/np/search?q=${encodeURIComponent(keyword)}&page=${p}&listSize=${listSize}`;
+      await page.goto(url, { waitUntil: 'domcontentloaded' });
+      for (let i = 0; i < 4; i++) { await page.mouse.wheel(0, 1600); await jitter(900); }
+
+      const items = await page.$$eval('li.search-product, li.product, li.baby-product', (els) => {
+        return els.map(el => {
+          const a = el.querySelector('a.search-product-link, a.baby-product-link, a.prod-link');
+          const href = a?.getAttribute('href') || '';
+          const m = href.match(/\/vp\/products\/(\d+)/) || href.match(/\/products\/(\d+)/);
+          const productId = m ? m[1] : null;
+          const itemId = el.getAttribute('data-item-id') || '';
+          const vendorItemId = el.getAttribute('data-vendor-item-id') || '';
+          const title =
+            el.querySelector('.name, .title, .descriptions-inner, .prod-name')?.textContent?.trim() || '';
+          const link = href ? (href.startsWith('http') ? href : `https://www.coupang.com${href}`) : '';
+          return productId ? { productId, itemId, vendorItemId, link, title } : null;
+        }).filter(Boolean);
+      });
+
+      for (let i = 0; i < items.length; i++) {
+        scanned++;
+        const it = items[i];
+        const match =
+          (want.itemId && it.itemId === want.itemId) ||
+          (want.productId && it.productId === want.productId);
+        if (match) {
+          return {
+            site: 'coupang',
+            keyword,
+            productUrl,
+            rank: scanned,
+            page: p,
+            scanned,
+            total,
+            foundItem: it,
+            idInfo: want,
+            requestId: uuidv4(),
+            itemsPerPage: items.length
+          };
+        }
+      }
+      await jitter(1200);
+    }
+
+    return {
+      site: 'coupang',
+      keyword,
+      productUrl,
+      rank: null,
+      page: null,
+      scanned,
+      total,
+      foundItem: null,
+      idInfo: want,
+      requestId: uuidv4(),
+      itemsPerPage: null
+    };
+  });
+}
+
+// =========================
+// 스마트 래퍼: axios 성공시 그대로, 실패/미발견시 PW로 승격
+// =========================
+async function rankOhouseSmart(keyword, productUrl, maxPages = 10, maxTries = 2) {
+  try {
+    const r = await rankOhouse(keyword, productUrl, maxPages, maxTries); // 기존 axios 버전
+    if (r && r.rank != null) return r;
+  } catch (_) {}
+  // axios 실패/미발견 → 브라우저 fallback
+  return await rankOhousePW(keyword, productUrl, { pageMax: Math.min(5, maxPages) });
+}
+
+async function rankCoupangSmart(keyword, productUrl, maxPages = 10, listSize = 36, maxTries = 2) {
+  try {
+    const r = await rankCoupang(keyword, productUrl, maxPages, listSize, maxTries); // 기존 axios 버전
+    if (r && r.rank != null) return r;
+  } catch (_) {}
+  return await rankCoupangPW(keyword, productUrl, { pageMax: Math.min(5, maxPages), listSize });
+}
+
 /* =========================
    오늘의집 랭킹
    ========================= */
@@ -572,10 +778,10 @@ app.get('/rank', async (req, res) => {
 
     const work = (async () => {
       if (site === 'ohou' || site === 'ohouse') {
-        return await rankOhouse(kw, productUrl, maxPages, maxTries);
+        return await rankOhouseSmart(kw, productUrl, maxPages, maxTries);
       } else if (site === 'coupang') {
         // coupang은 hedge(병렬) 효과를 fetchHtml 내부에서 사용
-        return await rankCoupang(kw, productUrl, maxPages, listSize, maxTries);
+        return await rankCoupangSmart(kw, productUrl, maxPages, listSize, maxTries);
       } else {
         throw new Error(`unsupported site: ${site}`);
       }
