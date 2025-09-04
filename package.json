@@ -1,12 +1,16 @@
 ﻿{
   "name": "aiplus-rank",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "engines": { "node": ">=20" },
+  "type": "module",
   "scripts": {
+    "dev": "node server.js",
     "start": "node server.js",
-    "start:local": "set PORT=8080&& node server.js",
-    "start:dev": "set DEBUG=1&& node server.js"
+    "ohou": "node rank-ohou-chrome.mjs",
+    "coupang": "node rank-coupang-chrome.mjs",
+    "log:ohou": "node tools/save-ohou.mjs",
+    "postinstall": "node -e \"try{require('child_process').execSync('npx playwright install --with-deps',{stdio:'inherit'})}catch(e){console.log('playwright install skip')}\""
   },
   "dependencies": {
     "axios": "^1.7.0",
@@ -16,6 +20,7 @@
     "https-proxy-agent": "^7.0.5",
     "socks-proxy-agent": "^8.0.3",
     "uuid": "^9.0.1",
-    "playwright": "^1.47.2"
+    "playwright": "^1.47.2",
+    "dotenv": "^16.4.5"
   }
 }
