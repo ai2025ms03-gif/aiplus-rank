@@ -6,9 +6,6 @@ const cheerio = require('cheerio');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { HttpProxyAgent } = require('http-proxy-agent');
 const { SocksProxyAgent } = require('socks-proxy-agent');
-const { CookieJar } = require('tough-cookie');
-const { wrapper: axiosCookieJarSupport } = require('axios-cookiejar-support');
-axiosCookieJarSupport(axios);
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
@@ -19,7 +16,6 @@ app.set('trust proxy', true);
    ========================= */
 app.get('/', (req, res) => res.send('OK'));
 app.get('/healthz', (req, res) => {
-  // 전역 풀이 아직 없으면, 환경변수를 읽어 길이를 보여주도록 보강
   const pools = global.__PROXIES || {
     ohou: parseProxyList('PROXY_URLS_OHOU'),
     coupang: parseProxyList('PROXY_URLS_COUPANG'),
@@ -46,7 +42,7 @@ const UA = [
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
 const browserHeaders = (host) => ({
-  'User-Agent': pick(UA),  // 매 요청마다 랜덤
+  'User-Agent': pick(UA),  // 매 요청 랜덤
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
   'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
   'Accept-Encoding': 'identity', // 일부 프록시/사이트와 호환성 ↑
@@ -63,7 +59,7 @@ const browserHeaders = (host) => ({
 const TIMEOUT_MS = Math.max(1, parseInt(process.env.TIMEOUT_MS || '30000', 10));
 
 /* ==========================================
-   프록시 유틸 (사이트별 풀 + SOCKS 지원 + 워밍업)
+   프록시 유틸 (사이트별 풀 + SOCKS 지원 + 워밍업 스킵 옵션)
    ========================================== */
 function parseProxyList(name) {
   return String(process.env[name] || '')
@@ -81,7 +77,7 @@ function makeProxyAgent(proxyUrl) {
   return proto === 'http:' ? new HttpProxyAgent(withScheme) : new HttpsProxyAgent(withScheme);
 }
 
-// 워밍업용 간단 통신 확인 (공급사 엔드포인트로 변경)
+// 워밍업용 간단 통신 확인 (공급사 엔드포인트)
 async function probe(proxyUrl) {
   try {
     const ag = makeProxyAgent(proxyUrl);
@@ -91,7 +87,7 @@ async function probe(proxyUrl) {
       validateStatus: () => true,
       headers: { 'user-agent': pick(UA), 'accept': 'application/json' }
     });
-    return r.status > 0; // (4xx라도) 응답 형식이 오면 통신 OK로 간주
+    return r.status > 0;
   } catch {
     return false;
   }
@@ -105,7 +101,6 @@ async function warmupProxies() {
     common: parseProxyList('PROXY_URLS')
   };
 
-  // 옵션: SKIP_PROXY_PROBE=true 이면 사전검증 건너뛰기
   const skipProbe = String(process.env.SKIP_PROXY_PROBE || '').toLowerCase() === 'true';
 
   if (!skipProbe) {
@@ -145,7 +140,7 @@ function nextProxy(site) {
   const r = (global.__RR?.[site]) || (global.__RR?.common);
   if (r) return r.next().value;
 
-  // RR이 아직 초기화 전이면 env에서 즉시 사용
+  // RR 초기화 전이면 env에서 즉시 사용
   const pools = {
     ohou: parseProxyList('PROXY_URLS_OHOU'),
     coupang: parseProxyList('PROXY_URLS_COUPANG'),
@@ -154,27 +149,58 @@ function nextProxy(site) {
   const list =
     (pools[site] && pools[site].length) ? pools[site]
     : (pools.common && pools.common.length ? pools.common : []);
-  return list.length ? list[0] : undefined; // 그래도 없으면 direct
+  return list.length ? list[0] : undefined;
 }
 
 /* ==========================================
-   HTML GET (프록시 회전 + 재시도 + 쿠키 지원)
+   초간단 쿠키 상태(문자열) 헬퍼 — 같은 요청 흐름에서만 사용
+   ========================================== */
+function buildCookieHeader(prevCookie, setCookieArray) {
+  // prevCookie: "a=1; b=2"
+  // setCookieArray: ["a=1; Path=/; ...", "c=3; Path=/; ..."]
+  const jar = new Map();
+  // 기존 쿠키 반영
+  if (prevCookie) {
+    prevCookie.split(';').map(s => s.trim()).forEach(kv => {
+      const [k, ...rest] = kv.split('=');
+      if (!k) return;
+      jar.set(k, rest.join('='));
+    });
+  }
+  // 신규 Set-Cookie 반영
+  (setCookieArray || []).forEach(sc => {
+    const part = String(sc).split(';')[0]; // "a=1"
+    const [k, ...rest] = part.split('=');
+    if (!k) return;
+    jar.set(k, rest.join('='));
+  });
+  // 재조립
+  return Array.from(jar.entries()).map(([k,v]) => `${k}=${v}`).join('; ');
+}
+
+/* ==========================================
+   HTML GET (프록시 회전 + 재시도 + 쿠키 문자열 지원)
    ========================================== */
 /**
  * @param {string} url
  * @param {object} extraHeaders - 추가 헤더
- * @param {object} opts - { site?: 'ohou'|'coupang'|'common', maxTries?: number, jar?: CookieJar }
- * @returns {Promise<string>} HTML 문자열
+ * @param {object} opts - { site?: 'ohou'|'coupang'|'common', maxTries?: number, cookieState?: {cookie?: string} }
+ * @returns {Promise<{html: string, cookie: string}>}
  */
-async function fetchHtml(url, extraHeaders = {}, { site = 'common', maxTries = 4, jar } = {}) {
+async function fetchHtml(url, extraHeaders = {}, { site = 'common', maxTries = 4, cookieState } = {}) {
   const errors = [];
   let hostHeader; try { hostHeader = new URL(url).host; } catch (_) {}
-  const cookieJar = jar || new CookieJar();
+  let cookie = cookieState?.cookie || '';
 
   for (let attempt = 1; attempt <= maxTries; attempt++) {
     const p = nextProxy(site);
     const agent = makeProxyAgent(p);
-    const headers = { ...browserHeaders(hostHeader), Connection: 'close', ...extraHeaders };
+    const headers = {
+      ...browserHeaders(hostHeader),
+      Connection: 'close',
+      ...(cookie ? { Cookie: cookie } : {}),
+      ...extraHeaders
+    };
     const t0 = Date.now();
 
     try {
@@ -186,9 +212,7 @@ async function fetchHtml(url, extraHeaders = {}, { site = 'common', maxTries = 4
         maxRedirects: 5,
         decompress: false,
         validateStatus: () => true,
-        transitional: { clarifyTimeoutError: true },
-        jar: cookieJar,
-        withCredentials: true
+        transitional: { clarifyTimeoutError: true }
       });
 
       const ms = Date.now() - t0;
@@ -197,8 +221,16 @@ async function fetchHtml(url, extraHeaders = {}, { site = 'common', maxTries = 4
         via: p ? new URL(/^[a-z]+:\/\//.test(p) ? p : `http://${p}`).host : 'direct'
       }));
 
-      if (res.status >= 200 && res.status < 300) return String(res.data);
-      if ([301,302,303,307,308].includes(res.status)) return String(res.data);
+      // 쿠키 수집
+      const setCookie = res.headers?.['set-cookie'] || res.headers?.['Set-Cookie'];
+      if (setCookie) {
+        cookie = buildCookieHeader(cookie, Array.isArray(setCookie) ? setCookie : [setCookie]);
+      }
+      if (cookieState) cookieState.cookie = cookie;
+
+      if (res.status >= 200 && res.status < 300) return { html: String(res.data), cookie };
+      if ([301,302,303,307,308].includes(res.status)) return { html: String(res.data), cookie };
+
       if ([403,429].includes(res.status)) {
         errors.push(`HTTP ${res.status} via ${p || 'direct'}`);
       } else {
@@ -209,7 +241,7 @@ async function fetchHtml(url, extraHeaders = {}, { site = 'common', maxTries = 4
       const msg = e?.message || String(e);
       errors.push(`${msg} via ${p || 'direct'}`);
       if (!/ECONNRESET|ETIMEDOUT|socket hang up|timeout/i.test(msg)) {
-        break; // 비네트워크 오류면 즉시 중단
+        break;
       }
     }
 
@@ -247,9 +279,11 @@ async function rankOhouse(keyword, productUrl, maxPages = 10) {
   const want = parseIdsFromUrl('ohou', productUrl).productId;
   if (!want) throw new Error('오늘의집: productId 파싱 실패(예: https://ohou.se/productions/1132252/selling)');
 
-  const jar = new CookieJar(); // 쿠키 유지
+  // 한 요청 흐름 내에서 공유할 쿠키 문자열 상태
+  const cookies = { cookie: '' };
+
   // 홈 워밍업(쿠키/세션 확보)
-  await fetchHtml('https://ohou.se/', {}, { site: 'ohou', jar });
+  await fetchHtml('https://ohou.se/', {}, { site: 'ohou', cookieState: cookies });
 
   let scanned = 0;
   let total = null;
@@ -268,7 +302,8 @@ async function rankOhouse(keyword, productUrl, maxPages = 10) {
 
     for (const u of candidates) {
       try {
-        html = await fetchHtml(u, { Referer: 'https://ohou.se/' }, { site: 'ohou', jar });
+        const r = await fetchHtml(u, { Referer: 'https://ohou.se/' }, { site: 'ohou', cookieState: cookies });
+        html = r.html;
         $ = cheerio.load(html);
 
         let hasItems = $('a[href*="/productions/"][href$="/selling"]').length > 0;
@@ -357,22 +392,24 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36) {
     throw new Error('쿠팡: productId 파싱 실패(예: https://www.coupang.com/vp/products/000?itemId=...&vendorItemId=...)');
   }
 
-  const jar = new CookieJar(); // 쿠키 유지
+  const cookies = { cookie: '' };
+
   // 홈 워밍업(쿠키/세션 확보)
   await fetchHtml('https://www.coupang.com/', {
     'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.7'
-  }, { site: 'coupang', jar });
+  }, { site: 'coupang', cookieState: cookies });
 
   let scanned = 0;
   let total = null;
 
   for (let p = 1; p <= maxPages; p++) {
     const url = `https://www.coupang.com/np/search?component=&q=${encodeURIComponent(keyword)}&page=${p}&listSize=${listSize}&channel=user`;
-    const html = await fetchHtml(url, {
+    const r = await fetchHtml(url, {
       Referer: 'https://www.coupang.com/',
       'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.7'
-    }, { site: 'coupang', jar });
+    }, { site: 'coupang', cookieState: cookies });
 
+    const html = r.html;
     const $ = cheerio.load(html);
 
     if (total == null) {
@@ -393,7 +430,6 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36) {
       items.push({ productId, itemId, vendorItemId, link, title });
     });
 
-    // 백업: 정규식 스캔 (정적 DOM이 비어 보일 때)
     if (items.length === 0) {
       const rx = /data-product-id="(\d+)"[^>]*data-item-id="(\d+)"[^>]*data-vendor-item-id="(\d+)"/g;
       let m; while ((m = rx.exec(html))) {
