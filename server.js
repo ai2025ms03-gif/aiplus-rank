@@ -19,12 +19,18 @@ app.set('trust proxy', true);
    ========================= */
 app.get('/', (req, res) => res.send('OK'));
 app.get('/healthz', (req, res) => {
+  // 전역 풀이 아직 없으면, 환경변수를 읽어 길이를 보여주도록 보강
+  const pools = global.__PROXIES || {
+    ohou: parseProxyList('PROXY_URLS_OHOU'),
+    coupang: parseProxyList('PROXY_URLS_COUPANG'),
+    common: parseProxyList('PROXY_URLS')
+  };
   res.json({
     ok: true,
     activeProxies: {
-      ohou: (global.__PROXIES?.ohou || []).length,
-      coupang: (global.__PROXIES?.coupang || []).length,
-      common: (global.__PROXIES?.common || []).length
+      ohou: (pools.ohou || []).length,
+      coupang: (pools.coupang || []).length,
+      common: (pools.common || []).length
     }
   });
 });
@@ -32,7 +38,7 @@ app.get('/healthz', (req, res) => {
 /* ================
    공통 유틸
    ================ */
-const UA_POOL = [
+const UA = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36'
@@ -40,7 +46,7 @@ const UA_POOL = [
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
 const browserHeaders = (host) => ({
-  'User-Agent': pick(UA_POOL),  // 매 요청마다 랜덤
+  'User-Agent': pick(UA),  // 매 요청마다 랜덤
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
   'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
   'Accept-Encoding': 'identity', // 일부 프록시/사이트와 호환성 ↑
@@ -65,6 +71,7 @@ function parseProxyList(name) {
     .map(s => s.trim())
     .filter(Boolean);
 }
+
 function makeProxyAgent(proxyUrl) {
   if (!proxyUrl) return undefined;
   const u = proxyUrl.trim();
@@ -73,46 +80,81 @@ function makeProxyAgent(proxyUrl) {
   if (proto.startsWith('socks')) return new SocksProxyAgent(withScheme);
   return proto === 'http:' ? new HttpProxyAgent(withScheme) : new HttpsProxyAgent(withScheme);
 }
+
+// 워밍업용 간단 통신 확인 (공급사 엔드포인트로 변경)
 async function probe(proxyUrl) {
   try {
     const ag = makeProxyAgent(proxyUrl);
-const r = await axios.get('https://ipinfo.thordata.com', {
-  httpAgent: ag, httpsAgent: ag,
-  timeout: Math.min(TIMEOUT_MS, 12000),
-  validateStatus: () => true,
-  headers: { 'user-agent': pick(UA), 'accept': 'application/json' }
-});
+    const r = await axios.get('https://ipinfo.thordata.com', {
+      httpAgent: ag, httpsAgent: ag,
+      timeout: Math.min(TIMEOUT_MS, 12000),
+      validateStatus: () => true,
+      headers: { 'user-agent': pick(UA), 'accept': 'application/json' }
+    });
     return r.status > 0; // (4xx라도) 응답 형식이 오면 통신 OK로 간주
   } catch {
     return false;
   }
 }
+
+// 프록시 풀 초기화
 async function warmupProxies() {
   const pools = {
     ohou: parseProxyList('PROXY_URLS_OHOU'),
     coupang: parseProxyList('PROXY_URLS_COUPANG'),
     common: parseProxyList('PROXY_URLS')
   };
-  for (const k of Object.keys(pools)) {
-    if (!pools[k].length) continue;
-    const ok = [];
-    for (const p of pools[k]) {
-      if (await probe(p)) ok.push(p);
+
+  // 옵션: SKIP_PROXY_PROBE=true 이면 사전검증 건너뛰기
+  const skipProbe = String(process.env.SKIP_PROXY_PROBE || '').toLowerCase() === 'true';
+
+  if (!skipProbe) {
+    for (const k of Object.keys(pools)) {
+      if (!pools[k].length) continue;
+      const ok = [];
+      for (const p of pools[k]) {
+        if (await probe(p)) ok.push(p);
+      }
+      pools[k] = ok;
     }
-    pools[k] = ok;
   }
+
   global.__PROXIES = pools;
+
+  // 라운드로빈 제너레이터
   function* rr(arr){ let i=0; while(true) yield arr[i++ % arr.length]; }
   global.__RR = {
     ohou: (pools.ohou?.length ? rr(pools.ohou) : null),
     coupang: (pools.coupang?.length ? rr(pools.coupang) : null),
     common: (pools.common?.length ? rr(pools.common) : null)
   };
+
+  console.log('[warmup]', {
+    skipProbe,
+    ohou: pools.ohou.length,
+    coupang: pools.coupang.length,
+    common: pools.common.length
+  });
 }
-warmupProxies(); // 비차단 워밍업
+
+// 비차단 워밍업 (서버 시작 시 1회)
+warmupProxies();
+
+// RR가 아직 없을 때도 env에서 즉시 1개 골라 쓰도록 안전화
 function nextProxy(site) {
   const r = (global.__RR?.[site]) || (global.__RR?.common);
-  return r ? r.next().value : undefined;
+  if (r) return r.next().value;
+
+  // RR이 아직 초기화 전이면 env에서 즉시 사용
+  const pools = {
+    ohou: parseProxyList('PROXY_URLS_OHOU'),
+    coupang: parseProxyList('PROXY_URLS_COUPANG'),
+    common: parseProxyList('PROXY_URLS')
+  };
+  const list =
+    (pools[site] && pools[site].length) ? pools[site]
+    : (pools.common && pools.common.length ? pools.common : []);
+  return list.length ? list[0] : undefined; // 그래도 없으면 direct
 }
 
 /* ==========================================
@@ -206,7 +248,8 @@ async function rankOhouse(keyword, productUrl, maxPages = 10) {
   if (!want) throw new Error('오늘의집: productId 파싱 실패(예: https://ohou.se/productions/1132252/selling)');
 
   const jar = new CookieJar(); // 쿠키 유지
-  await fetchHtml('https://ohou.se/', {}, { site: 'ohou', jar }); // 세션 워밍업
+  // 홈 워밍업(쿠키/세션 확보)
+  await fetchHtml('https://ohou.se/', {}, { site: 'ohou', jar });
 
   let scanned = 0;
   let total = null;
