@@ -41,10 +41,10 @@ const UA = [
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
 const browserHeaders = (host) => ({
-  'User-Agent': pick(UA),  // 매 요청 랜덤
+  'User-Agent': pick(UA),
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
   'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-  'Accept-Encoding': 'identity', // 일부 프록시/사이트와 호환성 ↑
+  'Accept-Encoding': 'identity',
   'Cache-Control': 'no-cache',
   'Pragma': 'no-cache',
   'sec-fetch-dest': 'document',
@@ -55,7 +55,8 @@ const browserHeaders = (host) => ({
   ...(host ? { Host: host } : {})
 });
 
-const TIMEOUT_MS = Math.max(1, parseInt(process.env.TIMEOUT_MS || '30000', 10));
+// 기본 타임아웃 45초로 상향 (env로 덮어쓰기 가능)
+const TIMEOUT_MS = Math.max(1, parseInt(process.env.TIMEOUT_MS || '45000', 10));
 
 /* ==========================================
    프록시 유틸 (사이트별 풀 + SOCKS 지원 + 워밍업 스킵 옵션)
@@ -76,7 +77,7 @@ function makeProxyAgent(proxyUrl) {
   return proto === 'http:' ? new HttpProxyAgent(withScheme) : new HttpsProxyAgent(withScheme);
 }
 
-// 워밍업용 간단 통신 확인 (공급사 엔드포인트)
+// 워밍업용 간단 통신 확인
 async function probe(proxyUrl) {
   try {
     const ag = makeProxyAgent(proxyUrl);
@@ -130,8 +131,6 @@ async function warmupProxies() {
     common: pools.common.length
   });
 }
-
-// 비차단 워밍업 (서버 시작 시 1회)
 warmupProxies();
 
 // RR가 아직 없을 때도 env에서 즉시 1개 골라 쓰도록 안전화
@@ -139,7 +138,6 @@ function nextProxy(site) {
   const r = (global.__RR?.[site]) || (global.__RR?.common);
   if (r) return r.next().value;
 
-  // RR 초기화 전이면 env에서 즉시 사용
   const pools = {
     ohou: parseProxyList('PROXY_URLS_OHOU'),
     coupang: parseProxyList('PROXY_URLS_COUPANG'),
@@ -177,18 +175,29 @@ function buildCookieHeader(prevCookie, setCookieArray) {
    ========================================== */
 /**
  * @param {string} url
- * @param {object} extraHeaders - 추가 헤더
- * @param {object} opts - { site?: 'ohou'|'coupang'|'common', maxTries?: number, cookieState?: {cookie?: string} }
+ * @param {object} extraHeaders
+ * @param {object} opts - {
+ *   site?: 'ohou'|'coupang'|'common',
+ *   maxTries?: number,
+ *   cookieState?: {cookie?: string},
+ *   forceProxy?: string,           // 디버그용: 특정 프록시 강제
+ *   hedgeCount?: number            // 병렬로 동시에 보내는 프록시 수(최대 2)
+ * }
  * @returns {Promise<{html: string, cookie: string}>}
  */
-async function fetchHtml(url, extraHeaders = {}, { site = 'common', maxTries = 4, cookieState } = {}) {
+async function fetchHtml(
+  url,
+  extraHeaders = {},
+  { site = 'common', maxTries = 4, cookieState, forceProxy, hedgeCount = 1 } = {}
+) {
   const errors = [];
   let hostHeader; try { hostHeader = new URL(url).host; } catch (_) {}
   let cookie = cookieState?.cookie || '';
 
-  for (let attempt = 1; attempt <= maxTries; attempt++) {
-    const p = nextProxy(site);
-    const agent = makeProxyAgent(p);
+  const triedHosts = new Set();
+
+  const tryOnce = async (proxyUrl) => {
+    const agent = makeProxyAgent(proxyUrl);
     const headers = {
       ...browserHeaders(hostHeader),
       Connection: 'close',
@@ -197,47 +206,108 @@ async function fetchHtml(url, extraHeaders = {}, { site = 'common', maxTries = 4
     };
     const t0 = Date.now();
 
+    const res = await axios.get(url, {
+      httpAgent: agent,
+      httpsAgent: agent,
+      headers,
+      timeout: TIMEOUT_MS,
+      maxRedirects: 5,
+      decompress: false,
+      validateStatus: () => true,
+      transitional: { clarifyTimeoutError: true }
+    });
+
+    const ms = Date.now() - t0;
+    const viaHost = proxyUrl ? new URL(/^[a-z]+:\/\//.test(proxyUrl) ? proxyUrl : `http://${proxyUrl}`).host : 'direct';
+
+    console.log(JSON.stringify({ site, host: hostHeader, status: res.status, ms, via: viaHost }));
+
+    const setCookie = res.headers?.['set-cookie'] || res.headers?.['Set-Cookie'];
+    if (setCookie) {
+      cookie = buildCookieHeader(cookie, Array.isArray(setCookie) ? setCookie : [setCookie]);
+    }
+    if (cookieState) cookieState.cookie = cookie;
+
+    if (res.status >= 200 && res.status < 300) return { html: String(res.data), cookie };
+    if ([301,302,303,307,308].includes(res.status)) return { html: String(res.data), cookie };
+
+    const snippet = String(res.data).slice(0, 240);
+    const err = [403,429].includes(res.status)
+      ? new Error(`HTTP ${res.status} via ${viaHost}`)
+      : new Error(`HTTP ${res.status} :: ${snippet}`);
+    err._via = viaHost;
+    throw err;
+  };
+
+  for (let attempt = 1; attempt <= maxTries; attempt++) {
+    // 프록시 선택 로직: 강제 프록시 > RR > 공용
+    let cand = [];
+    if (forceProxy) cand = [forceProxy];
+    else {
+      // attempt 마다 다른 프록시가 되도록 최대 3개 후보 뽑기
+      const seen = new Set();
+      for (let i = 0; i < 3; i++) {
+        const p = nextProxy(site);
+        if (!p) break;
+        const host = new URL(/^[a-z]+:\/\//.test(p) ? p : `http://${p}`).host;
+        if (triedHosts.has(host) || seen.has(host)) continue;
+        cand.push(p);
+        seen.add(host);
+      }
+      // 후보가 비면 하나는 넣기(마지막 수단)
+      if (cand.length === 0) {
+        const p = nextProxy(site);
+        if (p) cand = [p];
+      }
+    }
+
+    // 같은 호스트 반복 방지
+    cand = cand.filter(p => {
+      try {
+        const host = new URL(/^[a-z]+:\/\//.test(p) ? p : `http://${p}`).host;
+        return !triedHosts.has(host);
+      } catch { return true; }
+    });
+    if (cand.length === 0) {
+      // 호스트 세트를 초기화해서라도 진행
+      triedHosts.clear();
+      const p = nextProxy(site);
+      if (p) cand = [p];
+    }
+
     try {
-      const res = await axios.get(url, {
-        httpAgent: agent,
-        httpsAgent: agent,
-        headers,
-        timeout: TIMEOUT_MS,
-        maxRedirects: 5,
-        decompress: false,
-        validateStatus: () => true,
-        transitional: { clarifyTimeoutError: true }
+      // hedgeCount(최대 2) 만큼 병렬 요청 → 먼저 성공하는 쪽 채택
+      const n = Math.max(1, Math.min(2, hedgeCount));
+      const picks = cand.slice(0, n);
+      picks.forEach(p => {
+        try {
+          const host = new URL(/^[a-z]+:\/\//.test(p) ? p : `http://${p}`).host;
+          triedHosts.add(host);
+        } catch {}
       });
 
-      const ms = Date.now() - t0;
-      console.log(JSON.stringify({
-        site, host: hostHeader, status: res.status, ms,
-        via: p ? new URL(/^[a-z]+:\/\//.test(p) ? p : `http://${p}`).host : 'direct'
-      }));
-
-      const setCookie = res.headers?.['set-cookie'] || res.headers?.['Set-Cookie'];
-      if (setCookie) {
-        cookie = buildCookieHeader(cookie, Array.isArray(setCookie) ? setCookie : [setCookie]);
-      }
-      if (cookieState) cookieState.cookie = cookie;
-
-      if (res.status >= 200 && res.status < 300) return { html: String(res.data), cookie };
-      if ([301,302,303,307,308].includes(res.status)) return { html: String(res.data), cookie };
-
-      if ([403,429].includes(res.status)) {
-        errors.push(`HTTP ${res.status} via ${p || 'direct'}`);
+      if (n === 1) {
+        return await tryOnce(picks[0]);
       } else {
-        const snippet = String(res.data).slice(0, 240);
-        errors.push(`HTTP ${res.status} :: ${snippet}`);
+        const tasks = picks.map(p =>
+          tryOnce(p).catch(e => {
+            e._isHedgeFail = true;
+            throw e;
+          })
+        );
+        // 먼저 성공하는 놈을 사용
+        return await Promise.any(tasks);
       }
     } catch (e) {
       const msg = e?.message || String(e);
-      errors.push(`${msg} via ${p || 'direct'}`);
-      if (!/ECONNRESET|ETIMEDOUT|socket hang up|timeout/i.test(msg)) {
+      errors.push(msg);
+      // 네트워크 에러/타임아웃 계열만 재시도
+      if (!/ECONNRESET|ETIMEDOUT|socket hang up|timeout|HTTP 403|HTTP 429/i.test(msg)) {
         break;
       }
     }
 
+    // 지수 백오프 + 지터
     const wait = Math.min(3500, 500 * Math.pow(1.6, attempt)) + Math.floor(Math.random() * 300);
     await new Promise(r => setTimeout(r, wait));
   }
@@ -273,8 +343,7 @@ async function rankOhouse(keyword, productUrl, maxPages = 10, maxTries = 2) {
 
   const cookies = { cookie: '' };
 
-  // 홈 워밍업(쿠키/세션 확보)
-  await fetchHtml('https://ohou.se/', {}, { site: 'ohou', cookieState: cookies, maxTries });
+  await fetchHtml('https://ohou.se/', {}, { site: 'ohou', cookieState: cookies, maxTries, hedgeCount: 2 });
 
   let scanned = 0;
   let total = null;
@@ -293,7 +362,7 @@ async function rankOhouse(keyword, productUrl, maxPages = 10, maxTries = 2) {
 
     for (const u of candidates) {
       try {
-        const r = await fetchHtml(u, { Referer: 'https://ohou.se/' }, { site: 'ohou', cookieState: cookies, maxTries });
+        const r = await fetchHtml(u, { Referer: 'https://ohou.se/' }, { site: 'ohou', cookieState: cookies, maxTries, hedgeCount: 2 });
         html = r.html;
         $ = cheerio.load(html);
 
@@ -385,10 +454,9 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36, ma
 
   const cookies = { cookie: '' };
 
-  // 홈 워밍업(쿠키/세션 확보)
   await fetchHtml('https://www.coupang.com/', {
     'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.7'
-  }, { site: 'coupang', cookieState: cookies, maxTries });
+  }, { site: 'coupang', cookieState: cookies, maxTries, hedgeCount: 2 });
 
   let scanned = 0;
   let total = null;
@@ -398,7 +466,7 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36, ma
     const r = await fetchHtml(url, {
       Referer: 'https://www.coupang.com/',
       'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.7'
-    }, { site: 'coupang', cookieState: cookies, maxTries });
+    }, { site: 'coupang', cookieState: cookies, maxTries, hedgeCount: 2 });
 
     const html = r.html;
     const $ = cheerio.load(html);
@@ -480,7 +548,6 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36, ma
    ========================= */
 app.get('/rank', async (req, res) => {
   try {
-    // (선택) API 키 인증
     if (process.env.RELAY_KEY) {
       const key = req.header('X-Relay-Key') || req.query.key;
       if (key !== process.env.RELAY_KEY) {
@@ -493,20 +560,21 @@ app.get('/rank', async (req, res) => {
     const productUrl = String(req.query.productUrl || '').trim();
     const maxPages = Math.min(10, Math.max(1, parseInt(req.query.maxPages || '10', 10)));
 
-    // ⬇️ 추가: 재시도/페이지당 아이템/데드라인 (524 방지 핵심)
+    // 조절 가능한 파라미터
     const listSize = Math.min(120, Math.max(12, parseInt(req.query.listSize || (site === 'coupang' ? '36' : '36'), 10)));
     const maxTries = Math.min(3, Math.max(1, parseInt(req.query.maxTries || '2', 10)));
     const deadlineMs = Math.min(90000, Math.max(10000, parseInt(req.query.deadlineMs || '85000', 10)));
+    const forceProxy = req.query.forceProxy ? String(req.query.forceProxy) : undefined;
 
     if (!kw) return res.status(400).json({ error: 'kw required' });
     if (!productUrl) return res.status(400).json({ error: 'productUrl required' });
     if (!site) return res.status(400).json({ error: 'site required' });
 
-    // 실제 작업 + 데드라인 레이스 (느리면 깔끔히 끊고 524 예방)
     const work = (async () => {
       if (site === 'ohou' || site === 'ohouse') {
         return await rankOhouse(kw, productUrl, maxPages, maxTries);
       } else if (site === 'coupang') {
+        // coupang은 hedge(병렬) 효과를 fetchHtml 내부에서 사용
         return await rankCoupang(kw, productUrl, maxPages, listSize, maxTries);
       } else {
         throw new Error(`unsupported site: ${site}`);
