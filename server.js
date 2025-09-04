@@ -155,10 +155,7 @@ function nextProxy(site) {
    초간단 쿠키 상태(문자열) 헬퍼 — 같은 요청 흐름에서만 사용
    ========================================== */
 function buildCookieHeader(prevCookie, setCookieArray) {
-  // prevCookie: "a=1; b=2"
-  // setCookieArray: ["a=1; Path=/; ...", "c=3; Path=/; ..."]
   const jar = new Map();
-  // 기존 쿠키 반영
   if (prevCookie) {
     prevCookie.split(';').map(s => s.trim()).forEach(kv => {
       const [k, ...rest] = kv.split('=');
@@ -166,14 +163,12 @@ function buildCookieHeader(prevCookie, setCookieArray) {
       jar.set(k, rest.join('='));
     });
   }
-  // 신규 Set-Cookie 반영
   (setCookieArray || []).forEach(sc => {
-    const part = String(sc).split(';')[0]; // "a=1"
+    const part = String(sc).split(';')[0];
     const [k, ...rest] = part.split('=');
     if (!k) return;
     jar.set(k, rest.join('='));
   });
-  // 재조립
   return Array.from(jar.entries()).map(([k,v]) => `${k}=${v}`).join('; ');
 }
 
@@ -220,7 +215,6 @@ async function fetchHtml(url, extraHeaders = {}, { site = 'common', maxTries = 4
         via: p ? new URL(/^[a-z]+:\/\//.test(p) ? p : `http://${p}`).host : 'direct'
       }));
 
-      // 쿠키 수집
       const setCookie = res.headers?.['set-cookie'] || res.headers?.['Set-Cookie'];
       if (setCookie) {
         cookie = buildCookieHeader(cookie, Array.isArray(setCookie) ? setCookie : [setCookie]);
@@ -244,7 +238,6 @@ async function fetchHtml(url, extraHeaders = {}, { site = 'common', maxTries = 4
       }
     }
 
-    // 지수 백오프 + 지터
     const wait = Math.min(3500, 500 * Math.pow(1.6, attempt)) + Math.floor(Math.random() * 300);
     await new Promise(r => setTimeout(r, wait));
   }
@@ -274,15 +267,14 @@ function parseIdsFromUrl(site, productUrl) {
 /* =========================
    오늘의집 랭킹
    ========================= */
-async function rankOhouse(keyword, productUrl, maxPages = 10) {
+async function rankOhouse(keyword, productUrl, maxPages = 10, maxTries = 2) {
   const want = parseIdsFromUrl('ohou', productUrl).productId;
   if (!want) throw new Error('오늘의집: productId 파싱 실패(예: https://ohou.se/productions/1132252/selling)');
 
-  // 한 요청 흐름 내에서 공유할 쿠키 문자열 상태
   const cookies = { cookie: '' };
 
   // 홈 워밍업(쿠키/세션 확보)
-  await fetchHtml('https://ohou.se/', {}, { site: 'ohou', cookieState: cookies });
+  await fetchHtml('https://ohou.se/', {}, { site: 'ohou', cookieState: cookies, maxTries });
 
   let scanned = 0;
   let total = null;
@@ -301,7 +293,7 @@ async function rankOhouse(keyword, productUrl, maxPages = 10) {
 
     for (const u of candidates) {
       try {
-        const r = await fetchHtml(u, { Referer: 'https://ohou.se/' }, { site: 'ohou', cookieState: cookies });
+        const r = await fetchHtml(u, { Referer: 'https://ohou.se/' }, { site: 'ohou', cookieState: cookies, maxTries });
         html = r.html;
         $ = cheerio.load(html);
 
@@ -385,7 +377,7 @@ async function rankOhouse(keyword, productUrl, maxPages = 10) {
 /* =========================
    쿠팡 랭킹
    ========================= */
-async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36) {
+async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36, maxTries = 2) {
   const want = parseIdsFromUrl('coupang', productUrl);
   if (!want.productId) {
     throw new Error('쿠팡: productId 파싱 실패(예: https://www.coupang.com/vp/products/000?itemId=...&vendorItemId=...)');
@@ -396,7 +388,7 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36) {
   // 홈 워밍업(쿠키/세션 확보)
   await fetchHtml('https://www.coupang.com/', {
     'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.7'
-  }, { site: 'coupang', cookieState: cookies });
+  }, { site: 'coupang', cookieState: cookies, maxTries });
 
   let scanned = 0;
   let total = null;
@@ -406,7 +398,7 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36) {
     const r = await fetchHtml(url, {
       Referer: 'https://www.coupang.com/',
       'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.7'
-    }, { site: 'coupang', cookieState: cookies });
+    }, { site: 'coupang', cookieState: cookies, maxTries });
 
     const html = r.html;
     const $ = cheerio.load(html);
@@ -501,22 +493,31 @@ app.get('/rank', async (req, res) => {
     const productUrl = String(req.query.productUrl || '').trim();
     const maxPages = Math.min(10, Math.max(1, parseInt(req.query.maxPages || '10', 10)));
 
+    // ⬇️ 추가: 재시도/페이지당 아이템/데드라인 (524 방지 핵심)
+    const listSize = Math.min(120, Math.max(12, parseInt(req.query.listSize || (site === 'coupang' ? '36' : '36'), 10)));
+    const maxTries = Math.min(3, Math.max(1, parseInt(req.query.maxTries || '2', 10)));
+    const deadlineMs = Math.min(90000, Math.max(10000, parseInt(req.query.deadlineMs || '85000', 10)));
+
     if (!kw) return res.status(400).json({ error: 'kw required' });
     if (!productUrl) return res.status(400).json({ error: 'productUrl required' });
     if (!site) return res.status(400).json({ error: 'site required' });
 
-    let data;
-    if (site === 'ohou' || site === 'ohouse') {
-      data = await rankOhouse(kw, productUrl, maxPages);
-    } else if (site === 'coupang') {
-      const listSize = parseInt(req.query.listSize || '36', 10);
-      data = await rankCoupang(kw, productUrl, maxPages, listSize);
-    } else {
-      return res.status(400).json({ error: 'unsupported site', site });
-    }
-    res.json(data);
+    // 실제 작업 + 데드라인 레이스 (느리면 깔끔히 끊고 524 예방)
+    const work = (async () => {
+      if (site === 'ohou' || site === 'ohouse') {
+        return await rankOhouse(kw, productUrl, maxPages, maxTries);
+      } else if (site === 'coupang') {
+        return await rankCoupang(kw, productUrl, maxPages, listSize, maxTries);
+      } else {
+        throw new Error(`unsupported site: ${site}`);
+      }
+    })();
+
+    const timeoutP = new Promise((_, rej) => setTimeout(() => rej(new Error('deadline exceeded')), deadlineMs));
+    const data = await Promise.race([work, timeoutP]);
+    return res.json(data);
   } catch (err) {
-    res.status(500).json({ error: String(err.message || err), requestId: uuidv4() });
+    return res.status(500).json({ error: String(err.message || err), requestId: uuidv4() });
   }
 });
 
