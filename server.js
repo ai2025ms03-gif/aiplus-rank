@@ -1,4 +1,4 @@
-﻿/* eslint-disable */
+/* eslint-disable */
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -11,7 +11,7 @@ const app = express();
 app.set('trust proxy', true);
 
 /* =========================
-   헬스체크 (Koyeb/상태 확인)
+   기본 라우트 / 헬스체크
    ========================= */
 app.get('/', (req, res) => res.send('OK'));
 app.get('/healthz', (req, res) => {
@@ -30,15 +30,15 @@ app.get('/healthz', (req, res) => {
   });
 });
 
-/* ================
-   공통 유틸
-   ================ */
+/* ================ 공통 상수/유틸 ================ */
 const UA = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36'
 ];
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const TIMEOUT_MS = Math.max(1, parseInt(process.env.TIMEOUT_MS || '45000', 10));
+const HTTP_ONLY = String(process.env.HTTP_ONLY || '').toLowerCase() === 'true';
 
 const browserHeaders = (host) => ({
   'User-Agent': pick(UA),
@@ -55,12 +55,6 @@ const browserHeaders = (host) => ({
   ...(host ? { Host: host } : {})
 });
 
-// 기본 타임아웃 (ms)
-const TIMEOUT_MS = Math.max(1, parseInt(process.env.TIMEOUT_MS || '45000', 10));
-
-/* ==========================================
-   프록시 유틸 (HTTP/HTTPS + SOCKS 지원)
-   ========================================== */
 function parseProxyList(name) {
   return String(process.env[name] || '')
     .split(',')
@@ -77,7 +71,6 @@ function makeProxyAgent(proxyUrl) {
   return proto === 'http:' ? new HttpProxyAgent(withScheme) : new HttpsProxyAgent(withScheme);
 }
 
-// 프록시 통신 확인(워밍업용)
 async function probe(proxyUrl) {
   try {
     const ag = makeProxyAgent(proxyUrl);
@@ -93,14 +86,13 @@ async function probe(proxyUrl) {
   }
 }
 
-// 프록시 풀 초기화 + 라운드로빈
+/* ================ 프록시 풀 워밍업 ================ */
 async function warmupProxies() {
   const pools = {
     ohou: parseProxyList('PROXY_URLS_OHOU'),
     coupang: parseProxyList('PROXY_URLS_COUPANG'),
     common: parseProxyList('PROXY_URLS')
   };
-
   const skipProbe = String(process.env.SKIP_PROXY_PROBE || '').toLowerCase() === 'true';
 
   if (!skipProbe) {
@@ -113,7 +105,6 @@ async function warmupProxies() {
       pools[k] = ok;
     }
   }
-
   global.__PROXIES = pools;
 
   function* rr(arr){ let i=0; while(true) yield arr[i++ % arr.length]; }
@@ -132,12 +123,10 @@ async function warmupProxies() {
 }
 warmupProxies();
 
-// 다음 프록시(사이트별 우선, 없으면 common)
 function nextProxy(site) {
   const r = (global.__RR?.[site]) || (global.__RR?.common);
   if (r) return r.next().value;
 
-  // RR 미초기화시 환경변수 첫 항목 사용
   const pools = {
     ohou: parseProxyList('PROXY_URLS_OHOU'),
     coupang: parseProxyList('PROXY_URLS_COUPANG'),
@@ -149,9 +138,6 @@ function nextProxy(site) {
   return list.length ? list[0] : undefined;
 }
 
-/* ==========================================
-   쿠키 병합 (문자열 기반 단순 쿠키자)
-   ========================================== */
 function buildCookieHeader(prevCookie, setCookieArray) {
   const jar = new Map();
   if (prevCookie) {
@@ -170,30 +156,15 @@ function buildCookieHeader(prevCookie, setCookieArray) {
   return Array.from(jar.entries()).map(([k,v]) => `${k}=${v}`).join('; ');
 }
 
-/* ==========================================
-   HTML GET (프록시 회전 + 헤지 + 쿠키 관리)
-   ========================================== */
-/**
- * @param {string} url
- * @param {object} extraHeaders
- * @param {object} opts - {
- *   site?: 'ohou'|'coupang'|'common',
- *   maxTries?: number,
- *   cookieState?: {cookie?: string},
- *   forceProxy?: string,
- *   hedgeCount?: number            // 동시에 보낼 프록시 수(최대 2)
- * }
- * @returns {Promise<{html: string, cookie: string}>}
- */
+/* ================ HTTP GET with proxy + hedge ================ */
 async function fetchHtml(
   url,
   extraHeaders = {},
-  { site = 'common', maxTries = 4, cookieState, forceProxy, hedgeCount = 1 } = {}
+  { site = 'common', maxTries = 3, cookieState, forceProxy, hedgeCount = 2, abortSignal } = {}
 ) {
   const errors = [];
   let hostHeader; try { hostHeader = new URL(url).host; } catch (_) {}
   let cookie = cookieState?.cookie || '';
-
   const triedHosts = new Set();
 
   const tryOnce = async (proxyUrl) => {
@@ -205,7 +176,6 @@ async function fetchHtml(
       ...extraHeaders
     };
     const t0 = Date.now();
-
     const res = await axios.get(url, {
       httpAgent: agent,
       httpsAgent: agent,
@@ -213,13 +183,12 @@ async function fetchHtml(
       timeout: TIMEOUT_MS,
       maxRedirects: 5,
       decompress: false,
+      signal: abortSignal,
       validateStatus: () => true,
       transitional: { clarifyTimeoutError: true }
     });
-
     const ms = Date.now() - t0;
     const viaHost = proxyUrl ? new URL(/^[a-z]+:\/\//.test(proxyUrl) ? proxyUrl : `http://${proxyUrl}`).host : 'direct';
-
     console.log(JSON.stringify({ site, host: hostHeader, status: res.status, ms, via: viaHost }));
 
     const setCookie = res.headers?.['set-cookie'] || res.headers?.['Set-Cookie'];
@@ -240,7 +209,6 @@ async function fetchHtml(
   };
 
   for (let attempt = 1; attempt <= maxTries; attempt++) {
-    // 프록시 후보: 강제 프록시 > RR 선택 (중복 호스트 회피)
     let cand = [];
     if (forceProxy) cand = [forceProxy];
     else {
@@ -250,8 +218,7 @@ async function fetchHtml(
         if (!p) break;
         const host = new URL(/^[a-z]+:\/\//.test(p) ? p : `http://${p}`).host;
         if (triedHosts.has(host) || seen.has(host)) continue;
-        cand.push(p);
-        seen.add(host);
+        cand.push(p); seen.add(host);
       }
       if (cand.length === 0) {
         const p = nextProxy(site);
@@ -284,33 +251,23 @@ async function fetchHtml(
       if (n === 1) {
         return await tryOnce(picks[0]);
       } else {
-        const tasks = picks.map(p =>
-          tryOnce(p).catch(e => {
-            e._isHedgeFail = true;
-            throw e;
-          })
-        );
+        const tasks = picks.map(p => tryOnce(p));
         return await Promise.any(tasks);
       }
     } catch (e) {
       const msg = e?.message || String(e);
       errors.push(msg);
-      // 재시도 가능한 에러만 재시도
       if (!/ECONNRESET|ETIMEDOUT|socket hang up|timeout|HTTP 403|HTTP 429/i.test(msg)) {
         break;
       }
     }
-
     const wait = Math.min(3500, 500 * Math.pow(1.6, attempt)) + Math.floor(Math.random() * 300);
     await new Promise(r => setTimeout(r, wait));
   }
-
   throw new Error(errors.join(' | '));
 }
 
-/* =========================
-   도우미: URL에서 ID 추출
-   ========================= */
+/* ================ 유틸: URL에서 ID 파싱 ================ */
 function parseIdsFromUrl(site, productUrl) {
   const out = {};
   if (site === 'coupang') {
@@ -327,352 +284,108 @@ function parseIdsFromUrl(site, productUrl) {
   return out;
 }
 
-// =========================
-// Playwright Fallback 헬퍼
-// =========================
-async function withChromium(proxyUrl, fn) {
-  const { chromium } = await import('playwright'); // CJS에서도 동적 import
-  const browser = await chromium.launch({
-    headless: false, // 차단 회피에 유리(필요시 env로 전환 가능)
-    proxy: proxyUrl ? { server: proxyUrl } : undefined,
-    args: ['--disable-blink-features=AutomationControlled'],
-  });
-  try {
-    const ctx = await browser.newContext({
-      locale: 'ko-KR',
-      timezoneId: 'Asia/Seoul',
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-    });
-    const page = await ctx.newPage();
-    page.setDefaultTimeout(45000);
-    return await fn(page, ctx);
-  } finally {
-    await browser.close();
-  }
-}
-function jitter(ms) { return new Promise(r => setTimeout(r, ms + Math.floor(Math.random() * 700))); }
-
-// =========================
-// 오늘의집: Playwright Fallback
-// =========================
-async function rankOhousePW(keyword, productUrl, { pageMax = 5 } = {}) {
+/* ================ 오늘의집: HTTP-only 랭킹 ================ */
+async function rankOhouseHTTP(keyword, productUrl, { maxPages = 10, fast = false, maxScanPages = 5 } = {}) {
   const want = parseIdsFromUrl('ohou', productUrl).productId;
   if (!want) throw new Error('오늘의집 productId 파싱 실패(예: https://ohou.se/productions/1132252/selling)');
 
-  const proxy = nextProxy('ohou') || nextProxy('common');
+  const cookies = { cookie: '' };
+  await fetchHtml('https://ohou.se/', {}, { site: 'ohou', cookieState: cookies, maxTries: 2, hedgeCount: 2 });
 
-  return await withChromium(proxy, async (page) => {
-    await page.goto('https://ohou.se/', { waitUntil: 'domcontentloaded' });
-    await jitter(800);
+  const enc = encodeURIComponent(keyword);
+  const candidates = (page) => ([
+    `https://ohou.se/search/index?query=${enc}&page=${page}`,
+    `https://ohou.se/search?keyword=${enc}&page=${page}`
+  ]);
 
-    let scanned = 0;
-    let total = null;
-    for (let p = 1; p <= pageMax; p++) {
-      const url = `https://ohou.se/store/search?keyword=${encodeURIComponent(keyword)}&page=${p}`;
-      await page.goto(url, { waitUntil: 'domcontentloaded' });
-      for (let i = 0; i < 3; i++) { await page.mouse.wheel(0, 1400); await jitter(900); }
-
-      const items = await page.$$eval('a[href*="/productions/"][href$="/selling"]', (els) => {
-        return els.map(a => {
-          const href = a.getAttribute('href') || '';
-          const m = href.match(/\/productions\/(\d+)\/selling/);
-          const productId = m && m[1];
-          const title =
-            a.getAttribute('title') ||
-            (a.querySelector('[class*="production-item__"]')?.textContent || '').trim();
-          if (productId) {
-            return {
-              productId,
-              link: href.startsWith('http') ? href : `https://ohou.se${href}`,
-              title: title || ''
-            };
+  const scanPage = async (p, abortSignal) => {
+    let lastErr;
+    for (const u of candidates(p)) {
+      try {
+        const r = await fetchHtml(u, { Referer: 'https://ohou.se/' }, { site: 'ohou', cookieState: cookies, maxTries: 2, hedgeCount: 2, abortSignal });
+        const html = r.html;
+        const $ = cheerio.load(html);
+        const items = [];
+        $('a[href*="/productions/"][href$="/selling"]').each((_, a) => {
+          const href = $(a).attr('href') || '';
+          const pid = /\/productions\/(\d+)\/selling/.exec(href)?.[1];
+          if (pid) {
+            items.push({ productId: pid, link: href.startsWith('http') ? href : `https://ohou.se${href}` });
           }
-          return null;
-        }).filter(Boolean);
-      });
+        });
+        if (items.length) return { page: p, items };
+      } catch (e) { lastErr = e; }
+    }
+    if (lastErr) throw lastErr;
+    return { page: p, items: [] };
+  };
 
+  if (!fast) {
+    let scanned = 0;
+    for (let p = 1; p <= maxPages; p++) {
+      const { items } = await scanPage(p);
       const seen = new Set();
       const uniq = items.filter(it => (seen.has(it.productId) ? false : (seen.add(it.productId), true)));
-
       for (let i = 0; i < uniq.length; i++) {
         scanned++;
         if (String(uniq[i].productId) === String(want)) {
-          return {
-            site: 'ohou',
-            keyword,
-            productUrl,
-            rank: scanned,
-            page: p,
-            scanned,
-            total,
-            foundItem: uniq[i],
-            idInfo: { productId: want },
-            requestId: uuidv4(),
-            itemsPerPage: uniq.length
-          };
+          return { site: 'ohou', keyword, productUrl, rank: scanned, page: p, scanned, foundItem: uniq[i], idInfo: { productId: want }, requestId: uuidv4(), itemsPerPage: uniq.length };
         }
       }
-      await jitter(1200);
     }
+    return { site: 'ohou', keyword, productUrl, rank: null, page: null, scanned: null, foundItem: null, idInfo: { productId: want }, requestId: uuidv4() };
+  }
 
+  // fast: 동시 페이지 스캔 + 조기중단
+  const pagesToScan = Math.min(maxScanPages, maxPages);
+  const ac = new AbortController();
+  const tasks = [];
+  const pageSizeGuess = 60; // 오늘의집 체감값(SSR가변). 최종 rank는 누적 방식으로 계산
+  let found = null;
+
+  for (let p = 1; p <= pagesToScan; p++) {
+    tasks.push(
+      scanPage(p, ac.signal).then(({ page, items }) => {
+        if (found) return;
+        for (let i = 0; i < items.length; i++) {
+          if (String(items[i].productId) === String(want)) {
+            found = { page, index: i, item: items[i], countOnPrevPages: (page - 1) * pageSizeGuess };
+            ac.abort(); // 조기 중단
+            break;
+          }
+        }
+      }).catch(() => {})
+    );
+  }
+  await Promise.allSettled(tasks);
+
+  if (found) {
+    const rank = found.countOnPrevPages + found.index + 1;
     return {
-      site: 'ohou',
-      keyword,
-      productUrl,
-      rank: null,
-      page: null,
-      scanned,
-      total,
-      foundItem: null,
-      idInfo: { productId: want },
-      requestId: uuidv4()
+      site: 'ohou', keyword, productUrl,
+      rank, page: found.page, scanned: null,
+      foundItem: found.item, idInfo: { productId: want }, requestId: uuidv4()
     };
-  });
+  }
+  return { site: 'ohou', keyword, productUrl, rank: null, page: null, scanned: null, foundItem: null, idInfo: { productId: want }, requestId: uuidv4() };
 }
 
-// =========================
-/* 쿠팡: Playwright Fallback */
-// =========================
-async function rankCoupangPW(keyword, productUrl, { pageMax = 5, listSize = 72 } = {}) {
+/* ================ 쿠팡: HTTP-only 랭킹 ================ */
+async function rankCoupangHTTP(keyword, productUrl, { maxPages = 10, listSize = 36, fast = false, maxScanPages = 5 } = {}) {
   const want = parseIdsFromUrl('coupang', productUrl);
-  if (!want.productId) {
-    throw new Error('쿠팡 productId 파싱 실패(예: https://www.coupang.com/vp/products/000?itemId=...&vendorItemId=...)');
-  }
-
-  const proxy = nextProxy('coupang') || nextProxy('common');
-
-  return await withChromium(proxy, async (page) => {
-    let scanned = 0;
-    let total = null;
-
-    for (let p = 1; p <= pageMax; p++) {
-      const url =
-        `https://www.coupang.com/np/search?q=${encodeURIComponent(keyword)}&page=${p}&listSize=${listSize}`;
-      await page.goto(url, { waitUntil: 'domcontentloaded' });
-      for (let i = 0; i < 4; i++) { await page.mouse.wheel(0, 1600); await jitter(900); }
-
-      const items = await page.$$eval('li.search-product, li.product, li.baby-product', (els) => {
-        return els.map(el => {
-          const a = el.querySelector('a.search-product-link, a.baby-product-link, a.prod-link');
-          const href = a?.getAttribute('href') || '';
-          const m = href.match(/\/vp\/products\/(\d+)/) || href.match(/\/products\/(\d+)/);
-          const productId = m ? m[1] : null;
-          const itemId = el.getAttribute('data-item-id') || '';
-          const vendorItemId = el.getAttribute('data-vendor-item-id') || '';
-          const title =
-            el.querySelector('.name, .title, .descriptions-inner, .prod-name')?.textContent?.trim() || '';
-          const link = href ? (href.startsWith('http') ? href : `https://www.coupang.com${href}`) : '';
-          return productId ? { productId, itemId, vendorItemId, link, title } : null;
-        }).filter(Boolean);
-      });
-
-      for (let i = 0; i < items.length; i++) {
-        scanned++;
-        const it = items[i];
-        const match =
-          (want.itemId && it.itemId === want.itemId) ||
-          (want.productId && it.productId === want.productId);
-        if (match) {
-          return {
-            site: 'coupang',
-            keyword,
-            productUrl,
-            rank: scanned,
-            page: p,
-            scanned,
-            total,
-            foundItem: it,
-            idInfo: want,
-            requestId: uuidv4(),
-            itemsPerPage: items.length
-          };
-        }
-      }
-      await jitter(1200);
-    }
-
-    return {
-      site: 'coupang',
-      keyword,
-      productUrl,
-      rank: null,
-      page: null,
-      scanned,
-      total,
-      foundItem: null,
-      idInfo: want,
-      requestId: uuidv4(),
-      itemsPerPage: null
-    };
-  });
-}
-
-// =========================
-// 스마트 래퍼: axios → 실패 시 PW 승격
-// =========================
-async function rankOhouseSmart(keyword, productUrl, maxPages = 10, maxTries = 2) {
-  if (String(process.env.FAST_PW_OHOU || '').toLowerCase() === 'true') {
-    return await rankOhousePW(keyword, productUrl, { pageMax: Math.min(5, maxPages) });
-  }
-  try {
-    const r = await rankOhouse(keyword, productUrl, maxPages, maxTries); // axios 버전
-    if (r && r.rank != null) return r;
-  } catch (_) {}
-  return await rankOhousePW(keyword, productUrl, { pageMax: Math.min(5, maxPages) });
-}
-
-async function rankCoupangSmart(keyword, productUrl, maxPages = 10, listSize = 36, maxTries = 2) {
-  try {
-    const r = await rankCoupang(keyword, productUrl, maxPages, listSize, maxTries); // axios 버전
-    if (r && r.rank != null) return r;
-  } catch (_) {}
-  return await rankCoupangPW(keyword, productUrl, { pageMax: Math.min(5, maxPages), listSize });
-}
-
-/* =========================
-   오늘의집: axios 구현
-   ========================= */
-async function rankOhouse(keyword, productUrl, maxPages = 10, maxTries = 2) {
-  const want = parseIdsFromUrl('ohou', productUrl).productId;
-  if (!want) throw new Error('오늘의집: productId 추출 실패(예: https://ohou.se/productions/1132252/selling)');
+  if (!want.productId) throw new Error('쿠팡 productId 파싱 실패(예: https://www.coupang.com/vp/products/000?itemId=...&vendorItemId=...)');
 
   const cookies = { cookie: '' };
-  await fetchHtml('https://ohou.se/', {}, { site: 'ohou', cookieState: cookies, maxTries, hedgeCount: 2 });
+  await fetchHtml('https://www.coupang.com/', { 'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.7' }, { site: 'coupang', cookieState: cookies, maxTries: 2, hedgeCount: 2 });
 
-  let scanned = 0;
-  let total = null;
-
-  for (let p = 1; p <= maxPages; p++) {
-    const enc = encodeURIComponent(keyword);
-    const candidates = [
-      `https://ohou.se/search/index?query=${enc}&page=${p}`,
-      `https://ohou.se/search/index?query=${enc}&page=${p}`,
-      `https://ohou.se/search?keyword=${enc}&page=${p}`
-    ];
-
-    let html = null;
-    let $ = null;
-    const tried = [];
-
-    for (const u of candidates) {
-      try {
-        const r = await fetchHtml(u, { Referer: 'https://ohou.se/' }, { site: 'ohou', cookieState: cookies, maxTries, hedgeCount: 2 });
-        html = r.html;
-        $ = cheerio.load(html);
-
-        let hasItems = $('a[href*="/productions/"][href$="/selling"]').length > 0;
-        if (!hasItems) {
-          const m = String(html).match(/href="(\/productions\/\d+\/selling)"/g);
-          hasItems = !!(m && m.length);
-        }
-        if (!hasItems) {
-          tried.push(`200 but no items: ${u}`);
-          html = null; $ = null; continue;
-        }
-        break;
-      } catch (e) {
-        tried.push((e && e.message) ? e.message.slice(0, 120) : String(e));
-        html = null; $ = null;
-      }
-    }
-
-    if (!$) {
-      throw new Error(`오늘의집 검색 실패. tried=${tried.join(' | ')}`);
-    }
-
-    const items = [];
-    $('a[href*="/productions/"][href$="/selling"]').each((_, a) => {
-      const href = $(a).attr('href') || '';
-      const pid = /\/productions\/(\d+)\/selling/.exec(href)?.[1];
-      if (pid) {
-        const title = $(a).attr('title') || $(a).find('[class*="production-item__"]').text().trim();
-        items.push({
-          productId: pid,
-          link: href.startsWith('http') ? href : `https://ohou.se${href}`,
-          title: title || ''
-        });
-      }
-    });
-    if (items.length === 0) {
-      const rx = /href="(\/productions\/(\d+)\/selling)"/g;
-      let m; while ((m = rx.exec(html))) {
-        items.push({ productId: m[2], link: `https://ohou.se${m[1]}`, title: '' });
-      }
-    }
-
-    const seen = new Set();
-    const uniq = items.filter(it => (seen.has(it.productId) ? false : (seen.add(it.productId), true)));
-
-    for (let i = 0; i < uniq.length; i++) {
-      scanned++;
-      if (uniq[i].productId === want) {
-        return {
-          site: 'ohou',
-          keyword,
-          productUrl,
-          rank: scanned,
-          page: p,
-          scanned,
-          total,
-          foundItem: uniq[i],
-          idInfo: { productId: want },
-          requestId: uuidv4(),
-          itemsPerPage: uniq.length
-        };
-      }
-    }
-  }
-
-  return {
-    site: 'ohou',
-    keyword,
-    productUrl,
-    rank: null,
-    page: null,
-    scanned,
-    total,
-    foundItem: null,
-    idInfo: { productId: parseIdsFromUrl('ohou', productUrl).productId },
-    requestId: uuidv4()
-  };
-}
-
-/* =========================
-   쿠팡: axios 구현
-   ========================= */
-async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36, maxTries = 2) {
-  const want = parseIdsFromUrl('coupang', productUrl);
-  if (!want.productId) {
-    throw new Error('쿠팡: productId 추출 실패(예: https://www.coupang.com/vp/products/000?itemId=...&vendorItemId=...)');
-  }
-
-  const cookies = { cookie: '' };
-  await fetchHtml('https://www.coupang.com/', {
-    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.7'
-  }, { site: 'coupang', cookieState: cookies, maxTries, hedgeCount: 2 });
-
-  let scanned = 0;
-  let total = null;
-
-  for (let p = 1; p <= maxPages; p++) {
+  const scanPage = async (p, abortSignal) => {
     const url = `https://www.coupang.com/np/search?component=&q=${encodeURIComponent(keyword)}&page=${p}&listSize=${listSize}&channel=user`;
-    const r = await fetchHtml(url, {
-      Referer: 'https://www.coupang.com/',
-      'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.7'
-    }, { site: 'coupang', cookieState: cookies, maxTries, hedgeCount: 2 });
-
+    const r = await fetchHtml(url, { Referer: 'https://www.coupang.com/', 'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.7' }, { site: 'coupang', cookieState: cookies, maxTries: 2, hedgeCount: 2, abortSignal });
     const html = r.html;
     const $ = cheerio.load(html);
-
-    if (total == null) {
-      const txt = $('div.search-form strong').first().text().replace(/[^\d]/g, '');
-      total = txt ? parseInt(txt, 10) : null;
-    }
-
     const items = [];
     $('li.search-product[data-product-id]').each((_, li) => {
-      const el = cheerio(li);
+      const el = $(li);
       const productId = (el.attr('data-product-id') || '').trim();
       const itemId = (el.attr('data-item-id') || '').trim();
       const vendorItemId = (el.attr('data-vendor-item-id') || '').trim();
@@ -680,69 +393,70 @@ async function rankCoupang(keyword, productUrl, maxPages = 10, listSize = 36, ma
       const href = a.attr('href') || '';
       const link = href.startsWith('http') ? href : `https://www.coupang.com${href}`;
       const title = el.find('div.name').first().text().trim();
-      items.push({ productId, itemId, vendorItemId, link, title });
+      if (productId) items.push({ productId, itemId, vendorItemId, link, title });
     });
+    return { page: p, items };
+  };
 
-    if (items.length === 0) {
-      const rx = /data-product-id="(\d+)"[^>]*data-item-id="(\d+)"[^>]*data-vendor-item-id="(\d+)"/g;
-      let m; while ((m = rx.exec(html))) {
-        items.push({ productId: m[1], itemId: m[2], vendorItemId: m[3], link: '', title: '' });
-      }
-      const rx2 = /<a[^>]*class="search-product-link"[^>]*href="([^"]+)"/g;
-      let k = 0, m2; while ((m2 = rx2.exec(html))) {
-        if (items[k]) items[k].link = m2[1].startsWith('http') ? m2[1] : `https://www.coupang.com${m2[1]}`;
-        k++;
-      }
-    }
+  const match = (it) => {
+    if (want.vendorItemId && it.vendorItemId === want.vendorItemId) return true;
+    if (want.itemId && it.itemId === want.itemId) return true;
+    if (want.productId && it.productId === want.productId) return true;
+    return false;
+  };
 
-    const match = (it) => {
-      if (want.vendorItemId && it.vendorItemId === want.vendorItemId) return true;
-      if (want.itemId && it.itemId === want.itemId) return true;
-      if (want.productId && it.productId === want.productId) return true;
-      return false;
-    };
-
-    for (let i = 0; i < items.length; i++) {
-      scanned++;
-      if (match(items[i])) {
-        return {
-          site: 'coupang',
-          keyword,
-          productUrl,
-          rank: scanned,
-          page: p,
-          scanned,
-          total,
-          foundItem: items[i],
-          idInfo: want,
-          requestId: uuidv4(),
-          itemsPerPage: items.length
-        };
+  if (!fast) {
+    let scanned = 0;
+    for (let p = 1; p <= maxPages; p++) {
+      const { items } = await scanPage(p);
+      for (let i = 0; i < items.length; i++) {
+        scanned++;
+        if (match(items[i])) {
+          return { site: 'coupang', keyword, productUrl, rank: scanned, page: p, scanned, foundItem: items[i], idInfo: want, requestId: uuidv4(), itemsPerPage: items.length };
+        }
       }
     }
+    return { site: 'coupang', keyword, productUrl, rank: null, page: null, scanned: null, foundItem: null, idInfo: want, requestId: uuidv4() };
   }
 
-  return {
-    site: 'coupang',
-    keyword,
-    productUrl,
-    rank: null,
-    page: null,
-    scanned,
-    total,
-    foundItem: null,
-    idInfo: want,
-    requestId: uuidv4(),
-    itemsPerPage: null
-  };
+  // fast: 동시 페이지 스캔 + 조기중단
+  const pagesToScan = Math.min(maxScanPages, maxPages);
+  const ac = new AbortController();
+  const tasks = [];
+  let found = null;
+
+  for (let p = 1; p <= pagesToScan; p++) {
+    tasks.push(
+      scanPage(p, ac.signal).then(({ page, items }) => {
+        if (found) return;
+        for (let i = 0; i < items.length; i++) {
+          if (match(items[i])) {
+            found = { page, index: i, item: items[i] };
+            ac.abort(); // 조기 중단
+            break;
+          }
+        }
+      }).catch(() => {})
+    );
+  }
+  await Promise.allSettled(tasks);
+
+  if (found) {
+    const rank = (found.page - 1) * listSize + found.index + 1;
+    return { site: 'coupang', keyword, productUrl, rank, page: found.page, scanned: null, foundItem: found.item, idInfo: want, requestId: uuidv4(), itemsPerPage: listSize };
+  }
+  return { site: 'coupang', keyword, productUrl, rank: null, page: null, scanned: null, foundItem: null, idInfo: want, requestId: uuidv4() };
 }
 
-/* =========================
-   라우트
-   ========================= */
+/* ================ (옵션) Playwright Fallback ================ */
+// 기본은 HTTP-only. 정말 필요할 때만 쓰도록 남겨둠.
+// HTTP_ONLY=true 이거나 요청 파라미터 noPW=1이면 절대 사용하지 않음.
+// const { chromium } = await import('playwright');
+// ... (필요시 과거 버전 참고)
+
+/* ================ /rank API ================ */
 app.get('/rank', async (req, res) => {
   try {
-    // (선택) API 보호키
     if (process.env.RELAY_KEY) {
       const key = req.header('X-Relay-Key') || req.query.key;
       if (key !== process.env.RELAY_KEY) {
@@ -754,11 +468,10 @@ app.get('/rank', async (req, res) => {
     const kw = String(req.query.kw || '').trim();
     const productUrl = String(req.query.productUrl || '').trim();
     const maxPages = Math.min(10, Math.max(1, parseInt(req.query.maxPages || '10', 10)));
-
-    // 조절 파라미터
-    const listSize = Math.min(120, Math.max(12, parseInt(req.query.listSize || (site === 'coupang' ? '36' : '36'), 10)));
-    const maxTries = Math.min(3, Math.max(1, parseInt(req.query.maxTries || '2', 10)));
+    const listSize = Math.min(120, Math.max(12, parseInt(req.query.listSize || (site === 'coupang' ? '36' : '60'), 10)));
     const deadlineMs = Math.min(90000, Math.max(10000, parseInt(req.query.deadlineMs || '85000', 10)));
+    const fast = String(req.query.fast || '0') === '1';
+    const noPW = HTTP_ONLY || String(req.query.noPW || '0') === '1'; // 전역 또는 요청 단위로 PW 금지
 
     if (!kw) return res.status(400).json({ error: 'kw required' });
     if (!productUrl) return res.status(400).json({ error: 'productUrl required' });
@@ -766,9 +479,23 @@ app.get('/rank', async (req, res) => {
 
     const work = (async () => {
       if (site === 'ohou' || site === 'ohouse') {
-        return await rankOhouseSmart(kw, productUrl, maxPages, maxTries);
+        // HTTP-only 우선
+        const r = await rankOhouseHTTP(kw, productUrl, { maxPages, fast, maxScanPages: 6 });
+        if (r && r.rank != null) return r;
+
+        // noPW면 여기서 종료
+        if (noPW) return r;
+
+        // (옵션) PW Fallback 원하면 여기서 호출 (기본은 비활성)
+        // return await rankOhousePW(kw, productUrl, { pageMax: Math.min(5, maxPages) });
+        return r;
       } else if (site === 'coupang') {
-        return await rankCoupangSmart(kw, productUrl, maxPages, listSize, maxTries);
+        const r = await rankCoupangHTTP(kw, productUrl, { maxPages, listSize, fast, maxScanPages: 5 });
+        if (r && r.rank != null) return r;
+        if (noPW) return r;
+        // (옵션) PW Fallback 자리
+        // return await rankCoupangPW(kw, productUrl, { pageMax: Math.min(5, maxPages), listSize });
+        return r;
       } else {
         throw new Error(`unsupported site: ${site}`);
       }
@@ -783,4 +510,4 @@ app.get('/rank', async (req, res) => {
 });
 
 const port = process.env.PORT || 8080;
-app.listen(port, '0.0.0.0', () => console.log(`Relay listening on :${port}`));
+app.listen(port, '0.0.0.0', () => console.log(`Rank API listening on :${port}`));
