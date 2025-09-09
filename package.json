@@ -9,7 +9,7 @@
     "ohou": "node rank-ohou-chrome.mjs",
     "coupang": "node rank-coupang-chrome.mjs",
     "log:ohou": "node tools/save-ohou.mjs",
-    "postinstall": "node -e \"try{require('child_process').execSync('npx playwright install --with-deps',{stdio:'inherit'})}catch(e){console.log('playwright install skip')}\""
+    "postinstall": "node -e \"try{require('child_process').execSync('npx playwright install chromium --with-deps',{stdio:'inherit'})}catch(e){console.log('playwright install skip')}\""
   },
   "dependencies": {
     "axios": "^1.7.0",
@@ -23,4 +23,3 @@
     "dotenv": "^16.4.5"
   }
 }
-
